@@ -109,15 +109,30 @@ reading it with pandas before its first open in Excel yields empty columns.
 Duplicates are impossible thanks to the `UNIQUE` constraint on
 `robinhood_order_id`, so re-running is always safe.
 
-```
-*/15 9-16 * * 1-5 cd "/path/to/Trade Recorder" && ROBINHOOD_NO_BROWSER=1 ./venv/bin/python sync_robinhood.py >> sync.log 2>&1
+Set `ROBINHOOD_SINCE=auto` first, so each run fetches one page instead of
+re-walking all history.
+
+**Use launchd, not cron.** On macOS, editing a crontab needs Full Disk Access,
+whereas a user LaunchAgent needs no special permission. A LaunchAgent is
+installed at `~/Library/LaunchAgents/com.meizunhong.traderecorder.sync.plist`:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.meizunhong.traderecorder.sync.plist   # enable
+launchctl print gui/$(id -u)/com.meizunhong.traderecorder.sync                                     # status
+launchctl bootout gui/$(id -u)/com.meizunhong.traderecorder.sync                                   # disable
 ```
 
-`ROBINHOOD_NO_BROWSER=1` matters for scheduled runs. Access tokens expire every
-few days and are renewed silently using the refresh token — but if that ever
-fails, the fallback is a browser login. Unattended, that would open a window
-nobody sees and block until the OAuth timeout. With this set, the run fails
-immediately and says so in the log.
+It runs every 6 hours and appends to `sync.log`. A plain interval is used
+rather than a market-hours window on purpose: this machine is UTC+8, where US
+market hours fall at 21:30–04:00 local **and shift by an hour twice a year**
+with US daylight saving. Nothing here is time-critical — trades are recorded
+after the fact.
+
+`ROBINHOOD_NO_BROWSER=1` is set in the job. Access tokens expire every few days
+and renew silently via the refresh token, but if that ever fails the fallback is
+a browser login — which unattended would open a window nobody sees and block
+until the OAuth timeout. With the flag set, the run fails immediately and says
+so in the log.
 
 For scheduled runs set `ROBINHOOD_SINCE` a few days behind your newest stored
 trade. A full backfill walks every page of history; a bounded one usually needs a

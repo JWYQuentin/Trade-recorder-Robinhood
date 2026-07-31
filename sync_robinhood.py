@@ -29,6 +29,7 @@ import json
 import os
 import time
 import webbrowser
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import List, Optional, Protocol, Tuple
@@ -131,6 +132,8 @@ TOKEN_PATH = Path(__file__).parent / os.getenv("ROBINHOOD_TOKEN_FILE", ".rh_toke
 CALLBACK_PORT = int(os.getenv("ROBINHOOD_CALLBACK_PORT", "3030"))
 # Unattended runs (cron) should fail loudly rather than wait on a browser.
 NO_BROWSER = os.getenv("ROBINHOOD_NO_BROWSER", "").strip() not in ("", "0")
+# Print the server's full tool catalogue even when the tool name is pinned.
+VERBOSE = os.getenv("ROBINHOOD_VERBOSE", "").strip() not in ("", "0")
 
 
 class FileTokenStorage:
@@ -291,6 +294,12 @@ class RobinhoodMCPSource:
     # Stop after this many pages, so a misbehaving cursor can't loop forever.
     MAX_PAGES = 100
 
+    # With ROBINHOOD_SINCE=auto, start this many days BEFORE the newest trade
+    # we already have. The overlap is deliberate: a fill can settle late and
+    # land behind the newest timestamp we stored. Re-fetching it costs nothing
+    # because the UNIQUE index throws duplicates away.
+    OVERLAP_DAYS = 5
+
     def __init__(self):
         self.url = os.getenv(
             "ROBINHOOD_MCP_URL", "https://agent.robinhood.com/mcp/trading"
@@ -393,9 +402,13 @@ class RobinhoodMCPSource:
 
                 # --- Discover the server's tools -------------------------
                 tools = (await session.list_tools()).tools
-                print("Robinhood MCP tools available:")
-                for t in tools:
-                    print(f"  - {t.name}: {(t.description or '')[:80]}")
+                # Only dump the catalogue when we're actually hunting for the
+                # right tool (or asked to). Printing ~5KB of tool descriptions
+                # on every scheduled run just bloats sync.log.
+                if not self.tool_name or VERBOSE:
+                    print("Robinhood MCP tools available:")
+                    for t in tools:
+                        print(f"  - {t.name}: {(t.description or '')[:80]}")
 
                 # --- Pick the order-history tool --------------------------
                 tool = self._pick_orders_tool(tools)
@@ -410,6 +423,31 @@ class RobinhoodMCPSource:
                 # --- Call it (READ-ONLY), following pagination -------------
                 return await self._fetch_all_pages(session, tool.name)
 
+    def _resolve_since(self) -> str:
+        """
+        Work out the `created_at` lower bound for this run.
+
+        A literal date is used as-is. "auto" walks back OVERLAP_DAYS from the
+        newest fill already stored, which keeps a scheduled sync to a single
+        page instead of re-reading years of history. An empty database means
+        there's nothing to be incremental about, so we do a full backfill.
+        """
+        raw = self.since.strip()
+        if raw.lower() != "auto":
+            return raw
+
+        with db.get_connection() as conn:
+            newest = db.newest_filled_at(conn)
+        if not newest:
+            print("  (since=auto: database is empty, doing a full backfill)")
+            return ""
+
+        newest_dt = datetime.fromisoformat(newest.replace("Z", "+00:00"))
+        bound = (newest_dt - timedelta(days=self.OVERLAP_DAYS)).strftime("%Y-%m-%d")
+        print(f"  (since=auto: newest stored fill {newest[:10]}, "
+              f"asking from {bound})")
+        return bound
+
     async def _fetch_all_pages(self, session, tool_name: str) -> List[dict]:
         """
         Walk every page of order history.
@@ -420,11 +458,12 @@ class RobinhoodMCPSource:
         """
         orders: List[dict] = []
         cursor = None
+        since = self._resolve_since()
 
         for page in range(1, self.MAX_PAGES + 1):
             args = {"account_number": self.account_number, "state": "filled"}
-            if self.since:
-                args["created_at_gte"] = self.since
+            if since:
+                args["created_at_gte"] = since
             if cursor:
                 args["cursor"] = cursor
 

@@ -13,7 +13,7 @@ single file (`trades.db`) that lives next to this script.
 
 import sqlite3
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from models import Trade
 
@@ -84,6 +84,17 @@ def get_all_trades(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM trades ORDER BY filled_at DESC"
     ).fetchall()
+
+
+def newest_filled_at(conn: sqlite3.Connection) -> Optional[str]:
+    """
+    The most recent fill timestamp we've stored, or None if empty.
+
+    Used by the sync to work out how far back it needs to ask Robinhood,
+    so a scheduled run doesn't re-walk the entire history every time.
+    """
+    row = conn.execute("SELECT MAX(filled_at) FROM trades").fetchone()
+    return row[0] if row and row[0] else None
 
 
 if __name__ == "__main__":

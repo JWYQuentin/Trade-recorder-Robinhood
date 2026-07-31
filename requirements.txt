@@ -1,0 +1,13 @@
+# Dashboard
+streamlit>=1.35
+pandas>=2.0
+
+# Reads config (MCP URL, data source choice) from the .env file
+python-dotenv>=1.0
+
+# Official Model Context Protocol SDK — used to talk to Robinhood's MCP.
+# Not needed if you only run in mock mode.
+mcp>=1.0
+
+# Writes the Excel export (export_excel.py)
+openpyxl>=3.1

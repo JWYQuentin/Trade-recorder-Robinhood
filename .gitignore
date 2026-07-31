@@ -1,0 +1,14 @@
+# Live credentials — never commit these.
+.env
+.rh_tokens.json
+
+# Your trading history — personal data, not code. Covers the database,
+# any .bak copies of it, and the Excel export built from it.
+trades.db
+trades.db*
+*.xlsx
+sync.log
+
+venv/
+__pycache__/
+*.pyc

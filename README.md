@@ -142,10 +142,17 @@ single page.
 
 `id`, `robinhood_order_id` (UNIQUE — dedupe key), `symbol`, `side`,
 `quantity`, `average_price`, `status`, `filled_at`, `created_at`,
-`asset_type`, `raw_json` (full original order).
+`asset_type`, `fees`, `placed_agent`, `raw_json` (full original order).
 
-Fees and `placed_agent` (`user` / `recurring`) are **not** columns yet — they live
-inside `raw_json`, and `export_excel.py` reads them out from there.
+`placed_agent` records who placed the order — `user` for a manual trade,
+`recurring` for an automated investment — which is how you separate
+discretionary trades from dollar-cost averaging.
+
+`get_connection()` migrates an older database automatically: any missing column
+is added and backfilled from `raw_json`, once, with no re-sync needed. Note that
+`ALTER TABLE` appends, so a migrated database has the newer columns *after*
+`raw_json` while a freshly created one has them before. Nothing reads by
+position, so it doesn't matter.
 
 ## Files you must never commit
 

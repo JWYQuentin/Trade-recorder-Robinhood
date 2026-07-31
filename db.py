@@ -34,16 +34,70 @@ CREATE TABLE IF NOT EXISTS trades (
     filled_at          TEXT,
     created_at         TEXT,
     asset_type         TEXT,
+    fees               REAL,
+    placed_agent       TEXT,
     raw_json           TEXT
 );
 """
 
+# Columns added after the first version of this table shipped. SQLite has no
+# "ADD COLUMN IF NOT EXISTS", so _migrate() checks before adding. The value for
+# each already lives inside raw_json, so existing rows can be backfilled
+# without re-syncing from Robinhood.
+#
+# Note: ALTER TABLE appends, so a MIGRATED database has these two after
+# raw_json while a FRESH one (from CREATE_TABLE_SQL) has them before it.
+# Nothing depends on column order — every read is by name — but don't be
+# surprised by the difference when comparing two databases.
+ADDED_COLUMNS = {
+    "fees": "REAL",
+    "placed_agent": "TEXT",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """
+    Bring an older trades.db up to the current schema.
+
+    Idempotent, like CREATE TABLE IF NOT EXISTS above: adding a column and
+    backfilling it happen together, exactly once, the first time a database
+    written by an older version is opened.
+    """
+    import json
+
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
+
+    for column, sql_type in ADDED_COLUMNS.items():
+        if column in existing:
+            continue
+
+        conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {sql_type}")
+
+        # Backfill from the raw payload we already stored.
+        updates = []
+        for row in conn.execute(
+            "SELECT id, raw_json FROM trades WHERE raw_json IS NOT NULL"
+        ):
+            raw = json.loads(row["raw_json"])
+            value = raw.get("fees" if column == "fees" else "placed_agent")
+            if value is None:
+                continue
+            updates.append((float(value) if column == "fees" else str(value), row["id"]))
+
+        if updates:
+            conn.executemany(
+                f"UPDATE trades SET {column} = ? WHERE id = ?", updates
+            )
+        conn.commit()
+        print(f"db: added column '{column}', backfilled {len(updates)} row(s)")
+
 
 def get_connection() -> sqlite3.Connection:
-    """Open a connection and make sure the table exists."""
+    """Open a connection and make sure the schema is current."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row  # lets us access columns by name
     conn.execute(CREATE_TABLE_SQL)
+    _migrate(conn)
     return conn
 
 
@@ -58,8 +112,9 @@ def insert_trade(conn: sqlite3.Connection, trade: Trade) -> bool:
         """
         INSERT OR IGNORE INTO trades
             (robinhood_order_id, symbol, side, quantity, average_price,
-             status, filled_at, created_at, asset_type, raw_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             status, filled_at, created_at, asset_type, fees, placed_agent,
+             raw_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             trade.robinhood_order_id,
@@ -71,6 +126,8 @@ def insert_trade(conn: sqlite3.Connection, trade: Trade) -> bool:
             trade.filled_at,
             trade.created_at,
             trade.asset_type,
+            trade.fees,
+            trade.placed_agent,
             trade.raw_json,
         ),
     )

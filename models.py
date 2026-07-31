@@ -29,6 +29,8 @@ class Trade:
     filled_at: Optional[str]  # ISO-8601 timestamp when the order filled
     created_at: Optional[str] # ISO-8601 timestamp when the order was placed
     asset_type: str           # "stock" for the MVP (options may appear later)
+    fees: Optional[float]     # Regulatory fees on the order (often 0)
+    placed_agent: Optional[str]  # Who placed it: "user", "recurring", "agentic"
     raw_json: str             # Full original order as JSON, kept for debugging
 
 
@@ -71,6 +73,11 @@ def normalize_order(raw: dict) -> Optional[Trade]:
     created_at = _first(raw, "created_at", "submitted_at", "placed_at")
     asset_type = str(_first(raw, "asset_type", "instrument_type", default="stock")).lower()
 
+    # Not required — an order missing either is still worth recording. Note
+    # _first() skips "" but keeps 0, so a genuine zero fee survives.
+    fees = _first(raw, "fees", "fee", "total_fees")
+    placed_agent = _first(raw, "placed_agent", "source", "origin")
+
     # --- 3. Skip orders missing anything essential -----------------------
     if not order_id or not symbol or side not in ("buy", "sell"):
         return None
@@ -87,5 +94,7 @@ def normalize_order(raw: dict) -> Optional[Trade]:
         filled_at=filled_at,
         created_at=created_at,
         asset_type=asset_type,
+        fees=None if fees is None else float(fees),
+        placed_agent=None if placed_agent is None else str(placed_agent),
         raw_json=json.dumps(raw, default=str),
     )

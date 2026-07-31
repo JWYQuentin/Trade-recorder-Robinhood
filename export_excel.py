@@ -7,13 +7,11 @@ Two sheets:
                       that point back at the Trades sheet.
 
 The dollar columns are Excel FORMULAS, not numbers baked in by Python, so the
-workbook recalculates if you edit it. `fees` and `placed_agent` aren't columns
-in the database yet, so they're read out of each row's stored raw_json.
+workbook recalculates if you edit it.
 
 Run it with:  python export_excel.py      (after sync_robinhood.py)
 """
 
-import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,7 +30,7 @@ OUT_PATH = FOLDER / "trading record.xlsx"
 # =====================================================================
 
 def load_records() -> list[dict]:
-    """Read every trade, flattening the bits we want out of raw_json."""
+    """Read every trade out of the database."""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT * FROM trades ORDER BY filled_at DESC").fetchall()
@@ -40,7 +38,6 @@ def load_records() -> list[dict]:
 
     records = []
     for r in rows:
-        raw = json.loads(r["raw_json"]) if r["raw_json"] else {}
         records.append({
             # Timestamps arrive as ISO-8601 with a trailing Z; Excel wants a
             # naive datetime, so convert to UTC and drop the tzinfo.
@@ -51,8 +48,8 @@ def load_records() -> list[dict]:
             "side": r["side"],
             "quantity": r["quantity"],
             "price": r["average_price"],
-            "fees": float(raw.get("fees") or 0),
-            "placed_by": raw.get("placed_agent") or "",
+            "fees": float(r["fees"] or 0),
+            "placed_by": r["placed_agent"] or "",
             "order_id": r["robinhood_order_id"],
         })
     return records

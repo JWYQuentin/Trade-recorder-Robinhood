@@ -27,6 +27,7 @@ Run it with:  python sync_robinhood.py
 
 import json
 import os
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -128,6 +129,8 @@ class MockDataSource:
 
 TOKEN_PATH = Path(__file__).parent / os.getenv("ROBINHOOD_TOKEN_FILE", ".rh_tokens.json")
 CALLBACK_PORT = int(os.getenv("ROBINHOOD_CALLBACK_PORT", "3030"))
+# Unattended runs (cron) should fail loudly rather than wait on a browser.
+NO_BROWSER = os.getenv("ROBINHOOD_NO_BROWSER", "").strip() not in ("", "0")
 
 
 class FileTokenStorage:
@@ -161,7 +164,38 @@ class FileTokenStorage:
     async def set_tokens(self, tokens) -> None:
         data = self._read()
         data["tokens"] = tokens.model_dump(mode="json")
+        # Record WHEN we received them. `expires_in` is a duration, not a
+        # deadline, so on its own it says nothing about a token read back
+        # from disk hours later. See stored_expiry().
+        data["obtained_at"] = time.time()
         self._write(data)
+
+    def stored_expiry(self) -> Optional[float]:
+        """
+        Absolute epoch time at which the cached access token expires.
+
+        Why this exists: the SDK only records an expiry for tokens it minted
+        in the current process. Tokens loaded from disk get none, which makes
+        its is_token_valid() answer True no matter how stale they are — so it
+        sends an expired token, takes a 401, and restarts the full browser
+        flow instead of quietly spending the refresh token. Feeding it this
+        value makes an expired token look expired.
+
+        Falls back to the file's mtime for token files written before
+        `obtained_at` was recorded.
+        """
+        data = self._read()
+        expires_in = (data.get("tokens") or {}).get("expires_in")
+        if expires_in is None:
+            return None
+
+        obtained = data.get("obtained_at")
+        if obtained is None:
+            if not self.path.exists():
+                return None
+            obtained = self.path.stat().st_mtime
+
+        return float(obtained) + float(expires_in)
 
     async def get_client_info(self):
         from mcp.shared.auth import OAuthClientInformationFull
@@ -208,6 +242,15 @@ def _wait_for_callback() -> Tuple[str, Optional[str]]:
 
 async def _open_browser(authorization_url: str) -> None:
     """Show the user Robinhood's consent page."""
+    # On a scheduled run there is nobody to click "approve": opening a browser
+    # would just block on the callback until the SDK's 300s timeout. Fail
+    # immediately instead, so the log says what actually went wrong.
+    if NO_BROWSER:
+        raise RuntimeError(
+            "Robinhood needs re-authorization, but ROBINHOOD_NO_BROWSER is set. "
+            "Run `python sync_robinhood.py` by hand once to sign in again."
+        )
+
     print("\nOpening your browser to authorize Robinhood access...")
     print(f"If it doesn't open, visit:\n  {authorization_url}\n")
     webbrowser.open(authorization_url)
@@ -271,7 +314,8 @@ class RobinhoodMCPSource:
         from mcp.client.auth import OAuthClientProvider
         from mcp.shared.auth import OAuthClientMetadata
 
-        return OAuthClientProvider(
+        storage = FileTokenStorage(TOKEN_PATH)
+        provider = OAuthClientProvider(
             server_url=self.url,
             client_metadata=OAuthClientMetadata.model_validate({
                 "client_name": "Trade Recorder",
@@ -279,10 +323,56 @@ class RobinhoodMCPSource:
                 "grant_types": ["authorization_code", "refresh_token"],
                 "response_types": ["code"],
             }),
-            storage=FileTokenStorage(TOKEN_PATH),
+            storage=storage,
             redirect_handler=_open_browser,
             callback_handler=_await_callback,
         )
+
+        # Hand the SDK the cached token's real deadline. Without it, a token
+        # loaded from disk is treated as valid forever, the refresh token is
+        # never spent, and every expiry turns into a fresh browser login —
+        # which on a cron job is a silent hang. See stored_expiry().
+        provider.context.token_expiry_time = storage.stored_expiry()
+        return provider
+
+    async def _prime_oauth_metadata(self, provider) -> None:
+        """
+        Tell the provider where Robinhood actually issues tokens.
+
+        Robinhood mints tokens at api.robinhood.com, NOT at the MCP host. The
+        SDK only learns that during a full browser login, because discovery
+        lives inside its 401 handler. On a run that starts from cached tokens
+        it never discovers anything, so a refresh falls back to a guessed
+        `<mcp-host>/token`, gets a 404, and collapses into a browser login.
+
+        Fetching the well-known document up front (one small GET) makes the
+        refresh go to the right place. A failure here is not fatal — it just
+        restores the old fallback behaviour.
+        """
+        import httpx
+        from mcp.shared.auth import OAuthMetadata
+
+        parsed = urlparse(self.url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        candidates = (
+            f"{base}/.well-known/oauth-authorization-server{parsed.path}",
+            f"{base}/.well-known/oauth-authorization-server",
+        )
+
+        async with httpx.AsyncClient(timeout=15) as client:
+            for url in candidates:
+                try:
+                    resp = await client.get(url)
+                except httpx.HTTPError:
+                    continue
+                if resp.status_code == 200:
+                    provider.context.oauth_metadata = (
+                        OAuthMetadata.model_validate_json(resp.content)
+                    )
+                    return
+
+        print("  (warning: OAuth metadata discovery failed — a token refresh "
+              "may fall back to a browser login)")
 
     async def _fetch_orders_async(self) -> List[dict]:
         from mcp import ClientSession
@@ -294,7 +384,10 @@ class RobinhoodMCPSource:
                 "tool requires it. Use the account whose trades you want to record."
             )
 
-        async with streamablehttp_client(self.url, auth=self._build_auth()) as (read, write, _):
+        auth = self._build_auth()
+        await self._prime_oauth_metadata(auth)
+
+        async with streamablehttp_client(self.url, auth=auth) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
 

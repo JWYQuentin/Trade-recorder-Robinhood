@@ -110,8 +110,14 @@ Duplicates are impossible thanks to the `UNIQUE` constraint on
 `robinhood_order_id`, so re-running is always safe.
 
 ```
-*/15 9-16 * * 1-5 cd "/path/to/Trade Recorder" && ./venv/bin/python sync_robinhood.py >> sync.log 2>&1
+*/15 9-16 * * 1-5 cd "/path/to/Trade Recorder" && ROBINHOOD_NO_BROWSER=1 ./venv/bin/python sync_robinhood.py >> sync.log 2>&1
 ```
+
+`ROBINHOOD_NO_BROWSER=1` matters for scheduled runs. Access tokens expire every
+few days and are renewed silently using the refresh token — but if that ever
+fails, the fallback is a browser login. Unattended, that would open a window
+nobody sees and block until the OAuth timeout. With this set, the run fails
+immediately and says so in the log.
 
 For scheduled runs set `ROBINHOOD_SINCE` a few days behind your newest stored
 trade. A full backfill walks every page of history; a bounded one usually needs a

@@ -12,7 +12,6 @@ workbook recalculates if you edit it.
 Run it with:  python export_excel.py      (after sync_robinhood.py)
 """
 
-import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,21 +19,26 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+import db
+
 FOLDER = Path(__file__).parent
-DB_PATH = FOLDER / "trades.db"
 OUT_PATH = FOLDER / "trading record.xlsx"
 
 
 # =====================================================================
-# 1. Pull the trades out of SQLite
+# 1. Pull the data out of SQLite
+# =====================================================================
+#
+# Everything goes through db.get_connection() rather than a raw sqlite3
+# connect, so the schema is created/migrated first — otherwise exporting
+# from a database written by an older version would fail on the tables
+# that didn't exist yet.
 # =====================================================================
 
 def load_records() -> list[dict]:
     """Read every trade out of the database."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("SELECT * FROM trades ORDER BY filled_at DESC").fetchall()
-    conn.close()
+    with db.get_connection() as conn:
+        rows = db.get_all_trades(conn)
 
     records = []
     for r in rows:
@@ -55,6 +59,18 @@ def load_records() -> list[dict]:
     return records
 
 
+def load_positions() -> list[dict]:
+    """Current holdings snapshot, largest position first."""
+    with db.get_connection() as conn:
+        return [dict(r) for r in db.get_positions(conn)]
+
+
+def load_realized() -> list[dict]:
+    """Every realizing (closing) trade, most recent first."""
+    with db.get_connection() as conn:
+        return [dict(r) for r in db.get_realized_pnl(conn)]
+
+
 # =====================================================================
 # 2. Styling constants
 # =====================================================================
@@ -72,6 +88,7 @@ MONEY = '$#,##0.00;($#,##0.00);-'
 MONEY0 = '$#,##0;($#,##0);-'
 QTY = '#,##0.000000'
 INT = '#,##0'
+PCT = '0.0%;(0.0%);-'
 DATE = 'yyyy-mm-dd hh:mm'
 
 
@@ -207,7 +224,230 @@ def build_summary_sheet(ws, records, symbols, first, last):
 
 
 # =====================================================================
-# 5. Entry point
+# 5. Sheet 3 — current holdings and unrealized P&L
+# =====================================================================
+
+def build_holdings_sheet(ws, positions):
+    """What you own now, what it cost, and the gain you haven't taken."""
+    ws.cell(row=1, column=1, value="Holdings — unrealized P&L").font = TITLE
+    as_of = positions[0].get("as_of") or "unknown"
+    sources = ", ".join(sorted({p.get("price_source") or "?" for p in positions}))
+    ws.cell(row=2, column=1,
+            value=f"{len(positions)} open positions · snapshot {as_of} · "
+                  f"prices from {sources}").font = NOTE
+
+    HEAD = 4
+    tot = HEAD + 1 + len(positions)   # needed now: the % column divides by it
+    write_header(ws, ["Symbol", "Shares", "Avg Cost", "Last Price",
+                      "Cost Basis", "Market Value", "Unrealized P&L",
+                      "Unrealized %", "% of Portfolio"], row=HEAD)
+
+    for i, p in enumerate(positions):
+        row = HEAD + 1 + i
+        ws.cell(row=row, column=1, value=p["symbol"]).font = BOLD
+        ws.cell(row=row, column=2, value=p["quantity"]).number_format = QTY
+        ws.cell(row=row, column=3, value=p["average_buy_price"]).number_format = MONEY
+        ws.cell(row=row, column=4, value=p["last_price"]).number_format = MONEY
+        # Cost, value and gain are all derived — leave them as formulas so
+        # you can drop in your own price and watch the sheet re-figure.
+        ws.cell(row=row, column=5, value=f"=B{row}*C{row}").number_format = MONEY
+        ws.cell(row=row, column=6, value=f"=B{row}*D{row}").number_format = MONEY
+        ws.cell(row=row, column=7, value=f"=F{row}-E{row}").number_format = MONEY
+        # Guard the divide: a zero cost basis would otherwise give #DIV/0!.
+        ws.cell(row=row, column=8,
+                value=f'=IF(E{row}=0,"",G{row}/E{row})').number_format = PCT
+        # Share of the portfolio by market value — the quickest read on
+        # concentration, which the per-position dollar figures hide.
+        ws.cell(row=row, column=9,
+                value=f'=IF($F${tot}=0,"",F{row}/$F${tot})').number_format = PCT
+        for col in range(2, 10):
+            ws.cell(row=row, column=col).font = BODY
+
+    ws.cell(row=tot, column=1, value="TOTAL").font = BOLD
+    for col, fmt in ((5, MONEY), (6, MONEY), (7, MONEY)):
+        L = get_column_letter(col)
+        c = ws.cell(row=tot, column=col,
+                    value=f"=SUM({L}{HEAD + 1}:{L}{tot - 1})")
+        c.font = BOLD
+        c.number_format = fmt
+    c = ws.cell(row=tot, column=8, value=f'=IF(E{tot}=0,"",G{tot}/E{tot})')
+    c.font = BOLD
+    c.number_format = PCT
+    c = ws.cell(row=tot, column=9, value=f"=SUM(I{HEAD + 1}:I{tot - 1})")
+    c.font = BOLD
+    c.number_format = PCT
+    for col in range(1, 10):
+        ws.cell(row=tot, column=col).border = TOP
+
+    ws.cell(row=tot + 2, column=1,
+            value="Unrealized P&L is a live market figure — it moves with prices "
+                  "and is not money you have received. Realized gains are on "
+                  "their own sheet.").font = NOTE
+    ws.cell(row=tot + 3, column=1,
+            value="Avg Cost comes from Robinhood and already reflects partial "
+                  "sells, so it can look unlike your trade history for a "
+                  "position you have mostly sold out of.").font = NOTE
+
+    ws.freeze_panes = f"A{HEAD + 1}"
+    for col, width in zip(range(1, 10), (11, 14, 12, 12, 14, 14, 16, 13, 15)):
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.row_dimensions[HEAD].height = 28
+    return tot
+
+
+# =====================================================================
+# 6. Sheet 4 — realized P&L, per symbol and per closing trade
+# =====================================================================
+
+def build_realized_sheet(ws, realized):
+    """
+    Gains actually taken, on positions already closed.
+
+    Laid out summary-first: the per-symbol block at the top is what you
+    read, and it's built from SUMIF/COUNTIF over the detail rows below,
+    so the two can never drift apart.
+    """
+    symbols = sorted({r["symbol"] for r in realized})
+
+    ws.cell(row=1, column=1, value="Realized P&L — closed positions").font = TITLE
+    ws.cell(row=2, column=1,
+            value=f"{len(realized)} closing trades across {len(symbols)} "
+                  f"symbols. Excludes gains on what you still hold — "
+                  f"see the Holdings sheet.").font = NOTE
+
+    # Work out where the detail block lands before writing the summary,
+    # because the summary formulas point down into it.
+    SUM_HEAD = 4
+    sum_total = SUM_HEAD + 1 + len(symbols)
+    DET_HEAD = sum_total + 3
+    det_first, det_last = DET_HEAD + 1, DET_HEAD + len(realized)
+
+    SYM_R = f"$B${det_first}:$B${det_last}"
+    GAIN_R = f"$E${det_first}:$E${det_last}"
+
+    # ---- summary block -------------------------------------------------
+    write_header(ws, ["Symbol", "Closing Trades", "Realized P&L"], row=SUM_HEAD)
+    for i, sym in enumerate(symbols):
+        row = SUM_HEAD + 1 + i
+        ws.cell(row=row, column=1, value=sym).font = BOLD
+        c = ws.cell(row=row, column=2, value=f"=COUNTIF({SYM_R},$A{row})")
+        c.font, c.number_format = BODY, INT
+        c = ws.cell(row=row, column=3, value=f"=SUMIF({SYM_R},$A{row},{GAIN_R})")
+        c.font, c.number_format = BODY, MONEY
+
+    ws.cell(row=sum_total, column=1, value="TOTAL").font = BOLD
+    for col, fmt in ((2, INT), (3, MONEY)):
+        L = get_column_letter(col)
+        c = ws.cell(row=sum_total, column=col,
+                    value=f"=SUM({L}{SUM_HEAD + 1}:{L}{sum_total - 1})")
+        c.font, c.number_format = BOLD, fmt
+    for col in range(1, 4):
+        ws.cell(row=sum_total, column=col).border = TOP
+
+    # ---- detail block --------------------------------------------------
+    ws.cell(row=DET_HEAD - 1, column=1, value="Every closing trade").font = TITLE
+    write_header(ws, ["Date (UTC)", "Symbol", "Shares", "Close Price",
+                      "Realized P&L"], row=DET_HEAD)
+
+    for i, r in enumerate(realized):
+        row = det_first + i
+        stamp = r["timestamp"]
+        ws.cell(row=row, column=1, value=datetime.fromisoformat(
+            stamp.replace("Z", "+00:00")
+        ).astimezone(timezone.utc).replace(tzinfo=None)).number_format = DATE
+        ws.cell(row=row, column=2, value=r["symbol"])
+        ws.cell(row=row, column=3, value=r["quantity"]).number_format = QTY
+        ws.cell(row=row, column=4, value=r["price"]).number_format = MONEY
+        ws.cell(row=row, column=5, value=r["realized_gain"]).number_format = MONEY
+        for col in range(1, 6):
+            ws.cell(row=row, column=col).font = BODY
+
+    ws.cell(row=det_last + 2, column=1,
+            value="Figures come from Robinhood's own realized-P&L endpoint, not "
+                  "recomputed here — informational, not a tax document.").font = NOTE
+
+    ws.freeze_panes = f"A{SUM_HEAD + 1}"
+    for col, width in zip(range(1, 6), (19, 16, 14, 14, 16)):
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.row_dimensions[SUM_HEAD].height = 28
+    ws.row_dimensions[DET_HEAD].height = 28
+    return sum_total
+
+
+# =====================================================================
+# 7. Sheet 0 — the overview you land on
+# =====================================================================
+
+def build_overview_sheet(ws, trades_total_row, holdings_total_row,
+                         realized_total_row, counts):
+    """
+    One screen answering "where do I stand", pulled from the other sheets.
+
+    Every figure is a cross-sheet formula, never a copied number, so this
+    can't drift from the sheets it summarises. Realized and unrealized are
+    deliberately kept in separate blocks and never added together: one is
+    money received, the other moves with the market every day.
+    """
+    T, H, R = trades_total_row, holdings_total_row, realized_total_row
+    n_trades, n_pos, n_closed = counts
+
+    ws.cell(row=1, column=1, value="Trading Record — Overview").font = TITLE
+    ws.cell(row=2, column=1,
+            value=f"Generated {datetime.now():%Y-%m-%d %H:%M}. Every figure "
+                  f"below is a live reference to another sheet.").font = NOTE
+
+    def block(row, heading):
+        c = ws.cell(row=row, column=1, value=heading)
+        c.font = HEAD_FONT
+        c.fill = HEAD_FILL
+        ws.cell(row=row, column=2).fill = HEAD_FILL
+
+    def line(row, label, formula, fmt=MONEY, bold=False):
+        ws.cell(row=row, column=1, value=label).font = BOLD if bold else BODY
+        c = ws.cell(row=row, column=2, value=formula)
+        c.font = BOLD if bold else BODY
+        c.number_format = fmt
+
+    # --- what you hold now -------------------------------------------
+    block(4, "Portfolio today")
+    line(5, "Open positions", n_pos, INT)
+    line(6, "Cost basis", f"=Holdings!E{H}")
+    line(7, "Market value", f"=Holdings!F{H}")
+    line(8, "Unrealized P&L", f"=Holdings!G{H}", bold=True)
+    line(9, "Unrealized return", f"=Holdings!H{H}", PCT, bold=True)
+    # Holdings is sorted by market value, so row 5 is the biggest position.
+    line(10, "Largest position", "=Holdings!A5", "General")
+    line(11, "  as % of portfolio", f"=Holdings!I5", PCT)
+
+    # --- what you already banked --------------------------------------
+    block(13, "Realized (closed positions)")
+    line(14, "Closing trades", n_closed, INT)
+    line(15, "Realized P&L", f"='Realized P&L'!C{R}", bold=True)
+
+    # --- everything you've traded --------------------------------------
+    block(17, "All activity")
+    line(18, "Fills recorded", n_trades, INT)
+    line(19, "Total bought", f"=SUMIF(Trades!C2:C{T - 1},\"buy\",Trades!F2:F{T - 1})")
+    line(20, "Total sold", f"=SUMIF(Trades!C2:C{T - 1},\"sell\",Trades!F2:F{T - 1})")
+    line(21, "Net invested", "=B19-B20", bold=True)
+    line(22, "Fees paid", f"=Trades!G{T}")
+
+    ws.cell(row=24, column=1,
+            value="Realized and unrealized are shown separately on purpose. "
+                  "Realized P&L is money already received; unrealized is a "
+                  "market estimate that changes daily. Adding them together "
+                  "would imply a certainty neither has.").font = NOTE
+    ws.cell(row=25, column=1,
+            value='"Net invested" is capital committed (bought minus sold), '
+                  "not portfolio value — compare it with Market value above "
+                  "to see what that capital has become.").font = NOTE
+
+    ws.column_dimensions["A"].width = 26
+    ws.column_dimensions["B"].width = 18
+
+
+# =====================================================================
+# 8. Entry point
 # =====================================================================
 
 def export() -> None:
@@ -217,15 +457,44 @@ def export() -> None:
         return
 
     symbols = sorted({r["symbol"] for r in records})
+    positions = load_positions()
+    realized = load_realized()
 
     wb = Workbook()
-    first, last = build_trades_sheet(wb.active, records)
-    wb.active.title = "Trades"
+    trades_ws = wb.active
+    first, last = build_trades_sheet(trades_ws, records)
+    trades_ws.title = "Trades"
     build_summary_sheet(wb.create_sheet("Summary by Symbol"),
                         records, symbols, first, last)
+
+    # Holdings and realized P&L only exist once a portfolio snapshot has
+    # been synced. Skip rather than emit an empty sheet, so the workbook
+    # never implies you own nothing.
+    holdings_total = realized_total = None
+    if positions:
+        holdings_total = build_holdings_sheet(wb.create_sheet("Holdings"),
+                                              positions)
+    if realized:
+        realized_total = build_realized_sheet(wb.create_sheet("Realized P&L"),
+                                              realized)
+
+    # The overview references the others, so it is built last but moved to
+    # the front — opening on 576 raw trade rows buries the answer.
+    if holdings_total and realized_total:
+        overview = wb.create_sheet("Overview")
+        build_overview_sheet(overview, last + 1, holdings_total, realized_total,
+                             (len(records), len(positions), len(realized)))
+        wb.move_sheet(overview, offset=-len(wb.sheetnames) + 1)
+        wb.active = 0
+
     wb.save(OUT_PATH)
 
-    print(f"Wrote {OUT_PATH.name} — {len(records)} trades, {len(symbols)} symbols.")
+    print(f"Wrote {OUT_PATH.name}")
+    print(f"  Trades            {len(records):>4} fills, {len(symbols)} symbols")
+    print(f"  Holdings          {len(positions):>4} positions"
+          f"{'  (skipped — no snapshot)' if not positions else ''}")
+    print(f"  Realized P&L      {len(realized):>4} closing trades"
+          f"{'  (skipped — none synced)' if not realized else ''}")
     print("Formula cells have no cached values until Excel opens and "
           "recalculates the file.")
 

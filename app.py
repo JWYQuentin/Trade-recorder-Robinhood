@@ -50,6 +50,17 @@ realized = load_realized()
 
 SYNC_HINT = "Run `python sync_robinhood.py` in your terminal, then refresh."
 
+
+def money(amount: float) -> str:
+    """
+    Currency with the sign OUTSIDE the symbol: -$59.98, not $-59.98.
+
+    Plain f"${x:,.2f}" puts the minus after the dollar sign, which reads
+    badly on the P&L figures where negatives are the whole point.
+    """
+    return f"-${abs(amount):,.2f}" if amount < 0 else f"${amount:,.2f}"
+
+
 tab_trades, tab_holdings, tab_realized = st.tabs(
     ["Trades", "Holdings", "Realized P&L"]
 )
@@ -71,18 +82,92 @@ with tab_trades:
         sides = sorted(trades["side"].unique())
         selected_sides = st.sidebar.multiselect("Side", sides, default=sides)
 
+        # Most of this account's activity is automated recurring buying, which
+        # swamps the trades that were actual decisions. Filtering on
+        # placed_agent is the only way to look at one without the other.
+        # Driven by the values actually present, so a new source Robinhood
+        # starts reporting (e.g. "drip") shows up instead of being dropped.
+        agents = sorted(trades["placed_agent"].fillna("unknown").unique())
+        selected_agents = st.sidebar.multiselect("Placed by", agents, default=agents)
+
+        # filled_at is stored as an ISO-8601 string. Parse once, to dates, so
+        # the picker compares like with like. format="ISO8601" copes with
+        # timestamps that carry fractional seconds and ones that don't.
+        fill_dates = pd.to_datetime(
+            trades["filled_at"], format="ISO8601", utc=True
+        ).dt.date
+        earliest, latest = fill_dates.min(), fill_dates.max()
+        picked = st.sidebar.date_input(
+            "Filled between",
+            value=(earliest, latest),
+            min_value=earliest,
+            max_value=latest,
+        )
+        # Streamlit returns a 1-tuple midway through picking a range, before
+        # the second date is chosen. Hold the full range until both exist,
+        # otherwise the table blanks out between the two clicks.
+        if isinstance(picked, tuple) and len(picked) == 2:
+            start_date, end_date = picked
+        else:
+            start_date, end_date = earliest, latest
+
         st.sidebar.divider()
         st.sidebar.caption(f"To fetch new data:\n\n`python sync_robinhood.py`")
 
         filtered = trades[
             trades["symbol"].isin(selected_symbols)
             & trades["side"].isin(selected_sides)
+            & trades["placed_agent"].fillna("unknown").isin(selected_agents)
+            & fill_dates.between(start_date, end_date)
         ]
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Trades shown", len(filtered))
-        col2.metric("Buys", int((filtered["side"] == "buy").sum()))
-        col3.metric("Sells", int((filtered["side"] == "sell").sum()))
+        # Gross cash in and out. Fees are shown separately rather than folded
+        # in, so "invested" stays comparable to the prices in the table below.
+        gross = filtered["quantity"] * filtered["average_price"]
+        buys = filtered["side"] == "buy"
+        invested = gross[buys].sum()
+        proceeds = gross[~buys].sum()
+        total_fees = filtered["fees"].fillna(0).sum()
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Trades shown", f"{len(filtered):,}")
+        # delta_color="off" keeps these grey — they're counts, not movements,
+        # and a green/red arrow would imply a judgement.
+        col2.metric("Invested", money(invested),
+                    delta=f"{int(buys.sum()):,} buys", delta_color="off")
+        col3.metric("Proceeds", money(proceeds),
+                    delta=f"{int((~buys).sum()):,} sells", delta_color="off")
+        col4.metric("Fees", money(total_fees))
+
+        # ------------------------------------------------- cumulative curve
+        # Buys deploy capital, sells return it, so the running total is how
+        # much money is actually committed at any moment. One series, so the
+        # heading names it and no legend is needed. Colour is validated
+        # against both the light and dark chart surfaces.
+        st.subheader("Cumulative net invested")
+        curve = (
+            pd.DataFrame({
+                "date": fill_dates.loc[filtered.index],
+                # Signed flow: money out on a buy, money back on a sell.
+                "flow": gross.where(buys, -gross),
+            })
+            .groupby("date", as_index=False)["flow"].sum()
+            .sort_values("date")
+        )
+        if curve.empty:
+            st.caption("No trades match the current filters.")
+        else:
+            curve["Net invested"] = curve["flow"].cumsum()
+            st.area_chart(
+                curve.set_index("date")[["Net invested"]],
+                color="#2a78d6",
+                height=280,
+            )
+            st.caption(
+                "Cost of what you bought minus what you got back on sells. "
+                "It tracks capital committed, not portfolio value — for what "
+                "that capital is worth today, see the Holdings tab."
+            )
 
         # raw_json is stored for debugging, not for reading.
         display_cols = [
@@ -127,11 +212,11 @@ with tab_holdings:
 
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Positions", len(h))
-        col2.metric("Cost basis", f"${total_cost:,.2f}")
-        col3.metric("Market value", f"${total_value:,.2f}")
+        col2.metric("Cost basis", money(total_cost))
+        col3.metric("Market value", money(total_value))
         col4.metric(
             "Unrealized P&L",
-            f"${total_unrealized:,.2f}",
+            money(total_unrealized),
             delta=f"{total_unrealized / total_cost:.2%}" if total_cost else None,
         )
 
@@ -151,7 +236,7 @@ with tab_holdings:
                 "market_value": st.column_config.NumberColumn(
                     "market value", format="$%.2f"),
                 "unrealized": st.column_config.NumberColumn(
-                    "unrealized P&L", format="$%.2f"),
+                    "unrealized P&L", format="accounting"),
                 "unrealized_pct": st.column_config.NumberColumn(
                     "unrealized %", format="percent"),
             },
@@ -190,10 +275,12 @@ with tab_realized:
         losers = by_symbol[by_symbol["realized_gain"] < 0]
 
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total realized", f"${total:,.2f}")
+        col1.metric("Total realized", money(total))
         col2.metric("Closing trades", len(realized))
-        col3.metric("Symbols up", f"{len(winners)}  (+${winners['realized_gain'].sum():,.2f})")
-        col4.metric("Symbols down", f"{len(losers)}  (${losers['realized_gain'].sum():,.2f})")
+        col3.metric("Symbols up",
+                    f"{len(winners)}  (+{money(winners['realized_gain'].sum())})")
+        col4.metric("Symbols down",
+                    f"{len(losers)}  ({money(losers['realized_gain'].sum())})")
 
         st.subheader("By symbol")
         st.dataframe(
@@ -203,7 +290,7 @@ with tab_realized:
             column_config={
                 "trades": st.column_config.NumberColumn("closing trades"),
                 "realized_gain": st.column_config.NumberColumn(
-                    "realized P&L", format="$%.2f"),
+                    "realized P&L", format="accounting"),
             },
         )
 
@@ -216,7 +303,7 @@ with tab_realized:
                 "quantity": st.column_config.NumberColumn("shares", format="%.6f"),
                 "price": st.column_config.NumberColumn("close price", format="$%.2f"),
                 "realized_gain": st.column_config.NumberColumn(
-                    "realized P&L", format="$%.2f"),
+                    "realized P&L", format="accounting"),
             },
         )
 

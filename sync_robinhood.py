@@ -29,7 +29,7 @@ import json
 import os
 import time
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import List, Optional, Protocol, Tuple
@@ -53,6 +53,10 @@ class TradeDataSource(Protocol):
 
     def fetch_orders(self) -> List[dict]:
         """Return recent orders as raw dicts (any status; we filter later)."""
+        ...
+
+    def fetch_portfolio(self) -> Tuple[List[dict], List[dict]]:
+        """Return (open positions, realized P&L rows)."""
         ...
 
 
@@ -111,6 +115,16 @@ class MockDataSource:
                 "asset_type": "stock",
             },
         ]
+
+    def fetch_portfolio(self) -> Tuple[List[dict], List[dict]]:
+        """
+        No mock positions or realized P&L.
+
+        Both tables are replace-on-sync, and an empty result deliberately
+        leaves them untouched — so running in mock mode can't clobber a real
+        snapshot the way mock ORDERS would pollute the trades table.
+        """
+        return [], []
 
 
 # =====================================================================
@@ -279,6 +293,16 @@ async def _await_callback() -> Tuple[str, Optional[str]]:
 # order history (or the one you set via ROBINHOOD_ORDERS_TOOL in .env).
 # That way this code adapts if Robinhood renames things.
 # =====================================================================
+
+def _as_float(value) -> Optional[float]:
+    """
+    Robinhood sends every number as a string, sometimes with absurd
+    precision ("249.2102941534238085909240487"). None and "" mean absent.
+    """
+    if value in (None, ""):
+        return None
+    return float(value)
+
 
 class RobinhoodMCPSource:
     """
@@ -481,6 +505,142 @@ class RobinhoodMCPSource:
 
         return orders
 
+    # -----------------------------------------------------------------
+    # Portfolio: open positions (+ live prices) and realized P&L.
+    #
+    # These run in their OWN MCP session rather than sharing the orders
+    # one. It costs a second connection (~15s), but the orders path is
+    # verified and working and I'd rather not destabilise it. Tool names
+    # are fixed here, not configurable like ROBINHOOD_ORDERS_TOOL —
+    # they're confirmed against the live server and there's no ambiguity
+    # to resolve the way there was for order history.
+    # -----------------------------------------------------------------
+    POSITIONS_TOOL = "get_equity_positions"
+    QUOTES_TOOL = "get_equity_quotes"
+    REALIZED_PNL_TOOL = "get_pnl_trade_history"
+
+    # get_equity_quotes drops the `closes` block above 20 symbols.
+    QUOTE_BATCH = 20
+
+    def fetch_portfolio(self) -> Tuple[List[dict], List[dict]]:
+        """Return (positions, realized_pnl) ready for the database."""
+        import asyncio
+        return asyncio.run(self._fetch_portfolio_async())
+
+    async def _fetch_portfolio_async(self) -> Tuple[List[dict], List[dict]]:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        if not self.account_number:
+            raise RuntimeError("ROBINHOOD_ACCOUNT_NUMBER is not set in .env")
+
+        auth = self._build_auth()
+        await self._prime_oauth_metadata(auth)
+
+        async with streamablehttp_client(self.url, auth=auth) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                positions = await self._fetch_positions(session)
+                realized = await self._fetch_realized(session)
+                return positions, realized
+
+    async def _fetch_positions(self, session) -> List[dict]:
+        """Open positions, priced with a live quote for each symbol."""
+        raw: List[dict] = []
+        cursor = None
+        for _ in range(self.MAX_PAGES):
+            args = {"account_number": self.account_number}
+            if cursor:
+                args["cursor"] = cursor
+            payload = self._payload(await session.call_tool(self.POSITIONS_TOOL, args))
+            raw.extend(payload.get("positions", []))
+            cursor = self._next_cursor(payload)
+            if not cursor:
+                break
+
+        if not raw:
+            print("  positions: none returned")
+            return []
+
+        symbols = [p["symbol"] for p in raw if p.get("symbol")]
+        quotes = await self._fetch_quotes(session, symbols)
+
+        positions = []
+        for p in raw:
+            price, source = quotes.get(p["symbol"], (None, "unavailable"))
+            positions.append({
+                "symbol": p["symbol"],
+                "quantity": float(p.get("quantity") or 0),
+                "average_buy_price": _as_float(p.get("average_buy_price")),
+                "last_price": price,
+                "price_source": source,
+            })
+        print(f"  positions: {len(positions)}")
+        return positions
+
+    async def _fetch_quotes(self, session, symbols: List[str]) -> dict:
+        """
+        Map symbol -> (price, which_field_it_came_from).
+
+        Robinhood returns both a regular-session price and an
+        extended-hours one. Whichever carries the newer timestamp is the
+        current price; we record which so the dashboard can say so rather
+        than quietly mixing the two.
+        """
+        out: dict = {}
+        for i in range(0, len(symbols), self.QUOTE_BATCH):
+            batch = symbols[i:i + self.QUOTE_BATCH]
+            payload = self._payload(
+                await session.call_tool(self.QUOTES_TOOL, {"symbols": batch})
+            )
+            for entry in payload.get("results", []):
+                q = entry.get("quote") or {}
+                symbol = q.get("symbol")
+                if not symbol:
+                    continue
+
+                regular = (_as_float(q.get("last_trade_price")),
+                           q.get("venue_last_trade_time") or "")
+                extended = (_as_float(q.get("last_non_reg_trade_price")),
+                            q.get("venue_last_non_reg_trade_time") or "")
+
+                # ISO-8601 UTC strings sort chronologically, so a plain
+                # string comparison picks the fresher of the two.
+                if extended[0] is not None and extended[1] > regular[1]:
+                    out[symbol] = (extended[0], "extended_hours")
+                elif regular[0] is not None:
+                    out[symbol] = (regular[0], "regular_session")
+        return out
+
+    async def _fetch_realized(self, session) -> List[dict]:
+        """Every realizing (closing) trade, with the gain/loss on each."""
+        rows: List[dict] = []
+        cursor = None
+        for _ in range(self.MAX_PAGES):
+            args = {"account_number": self.account_number, "span": "all"}
+            if cursor:
+                args["cursor"] = cursor
+            payload = self._payload(
+                await session.call_tool(self.REALIZED_PNL_TOOL, args)
+            )
+            for t in payload.get("trades", []):
+                rows.append({
+                    "timestamp": t.get("timestamp"),
+                    "symbol": t.get("symbol"),
+                    "quantity": _as_float(t.get("quantity")),
+                    "price": _as_float(t.get("price")),
+                    "realized_gain": _as_float(t.get("realized_gain")),
+                })
+            # This tool paginates with `next_cursor`, not the `next` URL
+            # that the orders tool uses.
+            cursor = payload.get("next_cursor") or None
+            if not cursor:
+                break
+
+        total = sum(r["realized_gain"] or 0 for r in rows)
+        print(f"  realized P&L: {len(rows)} closing trade(s), total ${total:,.2f}")
+        return rows
+
     @staticmethod
     def _payload(result) -> dict:
         """
@@ -578,6 +738,22 @@ def run_sync() -> None:
     print(f"\nDone. Inserted {inserted} new trade(s), "
           f"skipped {skipped_dupe} duplicate(s), "
           f"skipped {skipped_unfilled} non-filled/invalid order(s).")
+
+    # --- Portfolio snapshot: holdings and realized P&L ------------------
+    # Separate from the trade history above: trades are immutable history,
+    # these are point-in-time and get replaced on every sync.
+    print("\nPortfolio snapshot:")
+    positions, realized = source.fetch_portfolio()
+    as_of = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    with db.get_connection() as conn:
+        n_pos = db.replace_positions(conn, positions, as_of)
+        n_pnl = db.replace_realized_pnl(conn, realized, as_of)
+
+    if n_pos or n_pnl:
+        print(f"  stored {n_pos} position(s) and {n_pnl} realized trade(s).")
+    else:
+        print("  nothing returned — previous snapshot left untouched.")
 
 
 if __name__ == "__main__":

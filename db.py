@@ -55,6 +55,36 @@ ADDED_COLUMNS = {
 }
 
 
+# Unlike `trades`, these two are SNAPSHOTS, not history. A position changes
+# every time you trade or the market moves, so appending would pile up
+# near-duplicate rows forever. Each sync replaces the table wholesale.
+CREATE_POSITIONS_SQL = """
+CREATE TABLE IF NOT EXISTS positions (
+    symbol            TEXT PRIMARY KEY,
+    quantity          REAL NOT NULL,
+    average_buy_price REAL,
+    last_price        REAL,
+    price_source      TEXT,   -- which quote field the price came from
+    as_of             TEXT    -- when this snapshot was taken
+);
+"""
+
+# Realized P&L is immutable history, but Robinhood returns the complete set
+# every time (span=all) and gives no stable per-row id — so replacing is both
+# simpler and less fragile than inventing a dedupe key.
+CREATE_REALIZED_PNL_SQL = """
+CREATE TABLE IF NOT EXISTS realized_pnl (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp     TEXT NOT NULL,
+    symbol        TEXT NOT NULL,
+    quantity      REAL,
+    price         REAL,
+    realized_gain REAL,
+    as_of         TEXT
+);
+"""
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """
     Bring an older trades.db up to the current schema.
@@ -97,6 +127,8 @@ def get_connection() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row  # lets us access columns by name
     conn.execute(CREATE_TABLE_SQL)
+    conn.execute(CREATE_POSITIONS_SQL)
+    conn.execute(CREATE_REALIZED_PNL_SQL)
     _migrate(conn)
     return conn
 
@@ -140,6 +172,65 @@ def get_all_trades(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     """Return every synced trade, newest fills first."""
     return conn.execute(
         "SELECT * FROM trades ORDER BY filled_at DESC"
+    ).fetchall()
+
+
+def replace_positions(conn: sqlite3.Connection, rows: List[dict], as_of: str) -> int:
+    """
+    Swap in a fresh positions snapshot. Returns how many rows were written.
+
+    An EMPTY list is treated as "we learned nothing" and leaves the existing
+    snapshot alone — a transient API hiccup shouldn't silently wipe your
+    holdings and make the dashboard read as if you own nothing.
+    """
+    if not rows:
+        return 0
+
+    with conn:  # one transaction: never half-replaced
+        conn.execute("DELETE FROM positions")
+        conn.executemany(
+            """
+            INSERT INTO positions
+                (symbol, quantity, average_buy_price, last_price,
+                 price_source, as_of)
+            VALUES (:symbol, :quantity, :average_buy_price, :last_price,
+                    :price_source, :as_of)
+            """,
+            [{**r, "as_of": as_of} for r in rows],
+        )
+    return len(rows)
+
+
+def replace_realized_pnl(conn: sqlite3.Connection, rows: List[dict], as_of: str) -> int:
+    """Swap in a fresh realized-P&L set. Empty means leave it alone."""
+    if not rows:
+        return 0
+
+    with conn:
+        conn.execute("DELETE FROM realized_pnl")
+        conn.executemany(
+            """
+            INSERT INTO realized_pnl
+                (timestamp, symbol, quantity, price, realized_gain, as_of)
+            VALUES (:timestamp, :symbol, :quantity, :price, :realized_gain,
+                    :as_of)
+            """,
+            [{**r, "as_of": as_of} for r in rows],
+        )
+    return len(rows)
+
+
+def get_positions(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    """Current holdings snapshot, largest position first."""
+    return conn.execute(
+        "SELECT * FROM positions ORDER BY quantity * last_price DESC"
+    ).fetchall()
+
+
+def get_realized_pnl(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    """Every realizing trade, most recent first."""
+    return conn.execute(
+        "SELECT * FROM realized_pnl ORDER BY timestamp DESC"
     ).fetchall()
 
 

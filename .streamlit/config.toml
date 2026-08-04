@@ -1,0 +1,14 @@
+# Visual theme. The default Streamlit red (#FF4B4B) is loud on a page that is
+# almost entirely numbers, and it competes with the red/green that actually
+# carry meaning here (loss/gain). Accent is a deep blue, used only on the
+# active tab, focus rings and the chart.
+[theme]
+base = "light"
+primaryColor = "#1C5CAB"
+backgroundColor = "#FBFBFA"
+secondaryBackgroundColor = "#F2F2EF"
+textColor = "#1A1A18"
+font = "sans serif"
+
+[server]
+headless = true

@@ -260,6 +260,13 @@ position, so it doesn't matter.
 - **Browser opens on every run** → `.rh_tokens.json` isn't being written; check
   folder permissions.
 - **Auth errors** → delete `.rh_tokens.json` and re-run to redo the OAuth flow.
+- **Scheduled sync silently stopped after moving the folder** → the LaunchAgent
+  stores an **absolute** path; nothing else in this project does. The symptom is
+  `/bin/sh: ./venv/bin/python: No such file or directory` in the log and
+  `last exit code = 127` from `launchctl print`. Fix all three paths in
+  `~/Library/LaunchAgents/com.meizunhong.traderecorder.sync.plist`, then
+  `bootout` and `bootstrap` it again. Note the log keeps being written to the
+  *old* location until you do, so look there first.
 - **`git push` fails with an HTTP2 framing error** → a local proxy is mangling
   HTTP/2. `git config http.version HTTP/1.1` fixes it.
 - **Reset everything** → delete `trades.db` and re-run the sync.

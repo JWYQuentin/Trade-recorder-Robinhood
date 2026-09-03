@@ -12,3 +12,12 @@ sync.log
 venv/
 __pycache__/
 *.pyc
+
+# Written by the Open Dashboard launcher.
+dashboard.log
+
+# macOS Finder metadata.
+.DS_Store
+
+# Local architecture notes — contains real portfolio figures.
+CLAUDE.md

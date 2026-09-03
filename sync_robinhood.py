@@ -59,6 +59,10 @@ class TradeDataSource(Protocol):
         """Return (open positions, realized P&L rows)."""
         ...
 
+    def fetch_history(self, price_symbols: List[str], start: str) -> dict:
+        """Return {"daily_prices": [...], "totals": {...}, "tax_lots": [...]}."""
+        ...
+
 
 # =====================================================================
 # 2. Mock data source — lets you test everything with zero setup
@@ -125,6 +129,10 @@ class MockDataSource:
         snapshot the way mock ORDERS would pollute the trades table.
         """
         return [], []
+
+    def fetch_history(self, price_symbols: List[str], start: str) -> dict:
+        """No mock price history — empty leaves every stored series alone."""
+        return {"daily_prices": [], "totals": None, "tax_lots": []}
 
 
 # =====================================================================
@@ -527,6 +535,54 @@ class RobinhoodMCPSource:
         import asyncio
         return asyncio.run(self._fetch_portfolio_async())
 
+    def fetch_history(self, price_symbols: List[str], start: str) -> dict:
+        """
+        Fetch the Phase 1 extras: daily closes, account totals, tax lots.
+
+        Separate from fetch_portfolio() so the existing two-tuple contract
+        (and MockDataSource, which implements it) stays untouched. Returns
+        {} for any source that can't supply them.
+        """
+        import asyncio
+        return asyncio.run(self._fetch_history_async(price_symbols, start))
+
+    async def _fetch_history_async(self, price_symbols: List[str],
+                                   start: str) -> dict:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+
+        if not self.account_number:
+            raise RuntimeError("ROBINHOOD_ACCOUNT_NUMBER is not set in .env")
+
+        auth = self._build_auth()
+        await self._prime_oauth_metadata(auth)
+
+        out: dict = {"daily_prices": [], "totals": None, "tax_lots": []}
+        async with streamablehttp_client(self.url, auth=auth) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+
+                # Each block is independently guarded: none of this is worth
+                # losing an otherwise good sync over. Factories rather than
+                # coroutines, so a failure in one doesn't leave the others
+                # created-but-never-awaited.
+                held = [p["symbol"] for p in await self._fetch_positions(session)]
+                steps = (
+                    ("prices", "daily_prices",
+                     lambda: self._fetch_daily_prices(session, price_symbols, start)),
+                    ("portfolio totals", "totals",
+                     lambda: self._fetch_portfolio_totals(session)),
+                    ("tax lots", "tax_lots",
+                     lambda: self._fetch_tax_lots(session, held)),
+                )
+                for label, key, make in steps:
+                    try:
+                        out[key] = await make()
+                    except Exception as exc:
+                        print(f"  ({label} failed: {type(exc).__name__}: "
+                              f"{str(exc)[:120]} — continuing)")
+        return out
+
     async def _fetch_portfolio_async(self) -> Tuple[List[dict], List[dict]]:
         from mcp import ClientSession
         from mcp.client.streamable_http import streamablehttp_client
@@ -639,6 +695,107 @@ class RobinhoodMCPSource:
 
         total = sum(r["realized_gain"] or 0 for r in rows)
         print(f"  realized P&L: {len(rows)} closing trade(s), total ${total:,.2f}")
+        return rows
+
+    # -----------------------------------------------------------------
+    # Phase 1: the extra reads that make performance measurable.
+    #
+    # These ride along in the portfolio session rather than opening a
+    # third connection. Each is individually non-fatal — a failure here
+    # must not cost you the orders and positions that already synced,
+    # so callers wrap them and carry on.
+    # -----------------------------------------------------------------
+    HISTORICALS_TOOL = "get_equity_historicals"
+    PORTFOLIO_TOOL = "get_portfolio"
+    TAX_LOTS_TOOL = "get_equity_tax_lots"
+
+    # get_equity_historicals accepts at most 10 symbols per call.
+    HISTORICALS_BATCH = 10
+
+    async def _fetch_daily_prices(self, session, symbols: List[str],
+                                  start: str) -> List[dict]:
+        """
+        Daily closes for `symbols` from `start` (YYYY-MM-DD) to now.
+
+        Asks for every symbol ever traded, not just those currently held:
+        valuing the portfolio on a past date needs prices for positions
+        since closed. Bars come back with string prices and a `begins_at`
+        timestamp whose date is the trading day.
+        """
+        rows: List[dict] = []
+        for i in range(0, len(symbols), self.HISTORICALS_BATCH):
+            batch = symbols[i:i + self.HISTORICALS_BATCH]
+            payload = self._payload(await session.call_tool(
+                self.HISTORICALS_TOOL,
+                {"symbols": batch,
+                 "start_time": f"{start}T00:00:00Z",
+                 "interval": "day"},
+            ))
+            for result in payload.get("results", []):
+                symbol = result.get("symbol")
+                if not symbol:
+                    continue
+                for bar in result.get("bars", []):
+                    close = _as_float(bar.get("close_price"))
+                    begins = bar.get("begins_at") or ""
+                    if close is None or not begins:
+                        continue
+                    rows.append({"symbol": symbol,
+                                 "date": begins[:10],
+                                 "close": close})
+            print(f"  prices: {len(batch)} symbol(s), {len(rows)} bar(s) so far")
+        return rows
+
+    async def _fetch_portfolio_totals(self, session) -> Optional[dict]:
+        """
+        Account-level equity and cash.
+
+        Cash matters for return figures: uninvested money is capital you
+        committed that earned nothing, and without this it is invisible.
+        There is no historical version of this endpoint, so the series can
+        only ever start from the first sync that records it.
+        """
+        payload = self._payload(await session.call_tool(
+            self.PORTFOLIO_TOOL, {"account_number": self.account_number}))
+        if not payload:
+            return None
+        totals = {
+            "total_value": _as_float(payload.get("total_value")),
+            "equity_value": _as_float(payload.get("equity_value")),
+            "cash": _as_float(payload.get("cash")),
+        }
+        print(f"  portfolio: equity ${totals['equity_value'] or 0:,.2f}, "
+              f"cash ${totals['cash'] or 0:,.2f}")
+        return totals
+
+    async def _fetch_tax_lots(self, session, symbols: List[str]) -> List[dict]:
+        """
+        Robinhood's own cost basis, one call per symbol (the tool takes a
+        single `symbol`, not a list).
+
+        Only open positions have lots; a fully-sold symbol returns none,
+        which is why this is driven by current holdings rather than by
+        everything ever traded.
+        """
+        rows: List[dict] = []
+        for symbol in symbols:
+            payload = self._payload(await session.call_tool(
+                self.TAX_LOTS_TOOL,
+                {"account_number": self.account_number, "symbol": symbol}))
+            for lot in payload.get("tax_lots", []):
+                lot_id = lot.get("open_lot_id")
+                if not lot_id:
+                    continue
+                rows.append({
+                    "open_lot_id": lot_id,
+                    "symbol": symbol,
+                    "quantity": _as_float(lot.get("quantity")),
+                    "cost_per_share": _as_float(lot.get("cost_per_share")),
+                    "cost_basis": _as_float(lot.get("tax_cost_basis")),
+                    "open_date": lot.get("open_date"),
+                    "term": lot.get("term"),
+                })
+        print(f"  tax lots: {len(rows)} open lot(s) across {len(symbols)} symbol(s)")
         return rows
 
     @staticmethod
@@ -754,6 +911,42 @@ def run_sync() -> None:
         print(f"  stored {n_pos} position(s) and {n_pnl} realized trade(s).")
     else:
         print("  nothing returned — previous snapshot left untouched.")
+
+    # --- History: the series performance metrics are computed from --------
+    # Positions are archived from what we just fetched rather than re-read,
+    # so the archive and the current snapshot always agree.
+    with db.get_connection() as conn:
+        n_arch = db.archive_positions(conn, positions, as_of)
+        symbols = sorted({r["symbol"] for r in conn.execute(
+            "SELECT DISTINCT symbol FROM trades")})
+    if n_arch:
+        print(f"  archived {n_arch} position(s) to the history table.")
+
+    print("\nPrice and account history:")
+    # Only backfill the whole range once; later runs top up from the newest
+    # close already stored.
+    with db.get_connection() as conn:
+        price_start = db.prices_start_from(conn, symbols, db.HISTORY_STARTS)
+    if price_start != db.HISTORY_STARTS:
+        print(f"  (prices: topping up from {price_start})")
+    try:
+        history = source.fetch_history(symbols, price_start)
+    except Exception as exc:
+        # The trades and snapshot above are already committed; this is
+        # strictly additive, so a failure here is a warning, not a crash.
+        print(f"  (unavailable: {type(exc).__name__}: {str(exc)[:150]})")
+        history = {}
+
+    with db.get_connection() as conn:
+        n_px = db.upsert_daily_prices(conn, history.get("daily_prices") or [])
+        n_tot = db.record_portfolio(conn, history.get("totals"), as_of)
+        n_lots = db.replace_tax_lots(conn, history.get("tax_lots") or [], as_of)
+
+    if n_px or n_tot or n_lots:
+        print(f"  stored {n_px} daily close(s), {n_tot} account total(s), "
+              f"{n_lots} tax lot(s).")
+    else:
+        print("  nothing returned — existing history left untouched.")
 
 
 if __name__ == "__main__":

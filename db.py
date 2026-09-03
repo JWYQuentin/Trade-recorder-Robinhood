@@ -85,6 +85,131 @@ CREATE TABLE IF NOT EXISTS realized_pnl (
 """
 
 
+# Append-only archive of every positions snapshot ever taken. `positions`
+# above stays the "what do I hold right now" table; this one is the history
+# that makes performance-over-time possible at all.
+#
+# Written in the same transaction as the positions swap, so the two can never
+# disagree about what a given sync saw.
+CREATE_POSITION_SNAPSHOTS_SQL = """
+CREATE TABLE IF NOT EXISTS position_snapshots (
+    snapshot_at       TEXT NOT NULL,   -- the sync's as_of, shared by the whole batch
+    symbol            TEXT NOT NULL,
+    quantity          REAL NOT NULL,
+    average_buy_price REAL,
+    last_price        REAL,
+    price_source      TEXT,
+    PRIMARY KEY (snapshot_at, symbol)
+);
+"""
+
+# Daily closes, the raw material for valuing the portfolio on any past date.
+# Backfilled once from get_equity_historicals and topped up each sync.
+#
+# `close` is stored as REAL though Robinhood sends strings with absurd
+# precision ("500.465000") — _as_float() in the sync handles the conversion.
+CREATE_DAILY_PRICES_SQL = """
+CREATE TABLE IF NOT EXISTS daily_prices (
+    symbol TEXT NOT NULL,
+    date   TEXT NOT NULL,   -- YYYY-MM-DD, the bar's begins_at date
+    close  REAL NOT NULL,
+    PRIMARY KEY (symbol, date)
+);
+"""
+
+# Account-level totals per sync: equity, cash, and the sum. Appended, never
+# replaced — this is the series that shows idle cash dragging on returns.
+#
+# There is no way to recover this for the past: the MCP exposes no historical
+# portfolio or transfer endpoint (checked 2026-09-01, all 67 tools). So the
+# cash series necessarily begins the day this table does, while the equity
+# series can be reconstructed backwards from daily_prices.
+CREATE_PORTFOLIO_SNAPSHOTS_SQL = """
+CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+    snapshot_at  TEXT PRIMARY KEY,
+    total_value  REAL,
+    equity_value REAL,
+    cash         REAL
+);
+"""
+
+# Robinhood's own per-lot cost basis for open positions. Replaced each sync
+# like `positions`, and for the same reason: lots are consumed by sells, so
+# appending would accumulate lots that no longer exist.
+#
+# Preferred over reconstructing basis from trade history because it is what
+# Robinhood will actually report on a tax form, and it carries the short/long
+# term split, which a naive replay cannot know.
+CREATE_TAX_LOTS_SQL = """
+CREATE TABLE IF NOT EXISTS tax_lots (
+    open_lot_id   TEXT PRIMARY KEY,
+    symbol        TEXT NOT NULL,
+    quantity      REAL,
+    cost_per_share REAL,
+    cost_basis    REAL,
+    open_date     TEXT,
+    term          TEXT,   -- "st" (short) or "lt" (long)
+    as_of         TEXT
+);
+"""
+
+# Shares held on 2025-09-22 that no trade in this database accounts for.
+#
+# Robinhood serves no order history before that date (verified with an
+# unbounded query: 594 filled orders, none earlier) and no tax lot opens
+# before it either, so these positions cannot be recovered from any API.
+# Replaying trades alone therefore drives these two symbols negative.
+#
+# The quantities below are exactly what the replay is short, which is the
+# only defensible reconstruction available: we know the shares existed
+# because they were sold. Cost basis is genuinely unknown and left NULL —
+# dollar P&L for these symbols comes from Robinhood's realized_pnl and is
+# correct; percentage returns are not, and the dashboard marks them.
+#
+# Together they are $171 against $52k of equity (0.33%). If Robinhood ever
+# widens its history window, delete this table and the replay stands alone.
+CREATE_OPENING_BALANCES_SQL = """
+CREATE TABLE IF NOT EXISTS opening_balances (
+    symbol     TEXT PRIMARY KEY,
+    quantity   REAL NOT NULL,
+    as_of      TEXT NOT NULL,
+    cost_basis REAL,          -- NULL: unknowable, predates available history
+    note       TEXT
+);
+"""
+
+# The history floor. Everything before this date is outside what Robinhood
+# will serve; analytics should not imply a record that starts earlier.
+HISTORY_STARTS = "2025-09-22"
+
+OPENING_BALANCE_ROWS = [
+    ("SPCX", 1.0, HISTORY_STARTS, None,
+     "Sold 2026-06-12 with no recorded buy; position opened before history."),
+    ("TSLA", 0.016904, HISTORY_STARTS, None,
+     "Recurring buys begin 2025-09-29; small holding carried in from before."),
+]
+
+
+def _seed_opening_balances(conn: sqlite3.Connection) -> None:
+    """
+    Insert the pre-history holdings once. Idempotent, and never overwrites:
+    if a future Robinhood backfill makes these unnecessary, deleting the rows
+    is enough — this won't put them back unless the table is empty.
+    """
+    existing = conn.execute("SELECT COUNT(*) FROM opening_balances").fetchone()[0]
+    if existing:
+        return
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO opening_balances
+            (symbol, quantity, as_of, cost_basis, note)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        OPENING_BALANCE_ROWS,
+    )
+    conn.commit()
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """
     Bring an older trades.db up to the current schema.
@@ -129,7 +254,13 @@ def get_connection() -> sqlite3.Connection:
     conn.execute(CREATE_TABLE_SQL)
     conn.execute(CREATE_POSITIONS_SQL)
     conn.execute(CREATE_REALIZED_PNL_SQL)
+    conn.execute(CREATE_POSITION_SNAPSHOTS_SQL)
+    conn.execute(CREATE_DAILY_PRICES_SQL)
+    conn.execute(CREATE_PORTFOLIO_SNAPSHOTS_SQL)
+    conn.execute(CREATE_TAX_LOTS_SQL)
+    conn.execute(CREATE_OPENING_BALANCES_SQL)
     _migrate(conn)
+    _seed_opening_balances(conn)
     return conn
 
 
@@ -243,6 +374,147 @@ def newest_filled_at(conn: sqlite3.Connection) -> Optional[str]:
     """
     row = conn.execute("SELECT MAX(filled_at) FROM trades").fetchone()
     return row[0] if row and row[0] else None
+
+
+# =====================================================================
+# Phase 1 additions: history that makes performance measurable
+# =====================================================================
+
+def archive_positions(conn: sqlite3.Connection, rows: List[dict], as_of: str) -> int:
+    """
+    Append this sync's positions to the permanent archive.
+
+    Unlike replace_positions(), nothing is deleted — this is the series that
+    later answers "what was I holding, and what was it worth, back then".
+    INSERT OR REPLACE keeps a re-run of the same sync idempotent.
+    """
+    if not rows:
+        return 0
+    with conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO position_snapshots
+                (snapshot_at, symbol, quantity, average_buy_price,
+                 last_price, price_source)
+            VALUES (:as_of, :symbol, :quantity, :average_buy_price,
+                    :last_price, :price_source)
+            """,
+            [{**r, "as_of": as_of} for r in rows],
+        )
+    return len(rows)
+
+
+def upsert_daily_prices(conn: sqlite3.Connection, rows: List[dict]) -> int:
+    """
+    Store daily closes. Existing (symbol, date) rows are overwritten, so a
+    re-run of the backfill corrects rather than duplicates.
+    """
+    if not rows:
+        return 0
+    with conn:
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO daily_prices (symbol, date, close)
+            VALUES (:symbol, :date, :close)
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def record_portfolio(conn: sqlite3.Connection, totals: Optional[dict],
+                     as_of: str) -> int:
+    """Append one account-level row (equity / cash / total) for this sync."""
+    if not totals:
+        return 0
+    with conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO portfolio_snapshots
+                (snapshot_at, total_value, equity_value, cash)
+            VALUES (:as_of, :total_value, :equity_value, :cash)
+            """,
+            {**totals, "as_of": as_of},
+        )
+    return 1
+
+
+def replace_tax_lots(conn: sqlite3.Connection, rows: List[dict], as_of: str) -> int:
+    """Swap in a fresh set of open tax lots. Empty means leave it alone."""
+    if not rows:
+        return 0
+    with conn:
+        conn.execute("DELETE FROM tax_lots")
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO tax_lots
+                (open_lot_id, symbol, quantity, cost_per_share, cost_basis,
+                 open_date, term, as_of)
+            VALUES (:open_lot_id, :symbol, :quantity, :cost_per_share,
+                    :cost_basis, :open_date, :term, :as_of)
+            """,
+            [{**r, "as_of": as_of} for r in rows],
+        )
+    return len(rows)
+
+
+def get_daily_prices(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    """Every stored daily close, oldest first."""
+    return conn.execute(
+        "SELECT symbol, date, close FROM daily_prices ORDER BY date, symbol"
+    ).fetchall()
+
+
+def get_opening_balances(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    """Pre-history holdings the trade replay can't account for."""
+    return conn.execute("SELECT * FROM opening_balances").fetchall()
+
+
+def get_portfolio_snapshots(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    """Account-level equity/cash series, oldest first."""
+    return conn.execute(
+        "SELECT * FROM portfolio_snapshots ORDER BY snapshot_at"
+    ).fetchall()
+
+
+def get_tax_lots(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    """Open tax lots, newest open_date first."""
+    return conn.execute(
+        "SELECT * FROM tax_lots ORDER BY symbol, open_date DESC"
+    ).fetchall()
+
+
+def prices_start_from(conn: sqlite3.Connection, symbols: List[str],
+                      floor: str) -> str:
+    """
+    The date a price fetch should start from to fill everything missing.
+
+    A full backfill is only needed once. After that the newest stored close
+    is the sensible lower bound — but only if EVERY symbol reaches that far,
+    since a newly traded symbol has no history at all and would be silently
+    left with a gap. Any shortfall drops back to the floor.
+    """
+    coverage = price_coverage(conn)
+    if not coverage or any(s not in coverage for s in symbols):
+        return floor
+
+    # The oldest "newest close" across symbols: fetching from here tops up
+    # whichever symbol has fallen furthest behind.
+    oldest_latest = min(hi for _lo, hi, _n in coverage.values())
+    return max(floor, oldest_latest)
+
+
+def price_coverage(conn: sqlite3.Connection) -> dict:
+    """Per-symbol (first_date, last_date, n) for the stored price history."""
+    return {
+        r["symbol"]: (r["lo"], r["hi"], r["n"])
+        for r in conn.execute(
+            """
+            SELECT symbol, MIN(date) lo, MAX(date) hi, COUNT(*) n
+            FROM daily_prices GROUP BY symbol
+            """
+        )
+    }
 
 
 if __name__ == "__main__":

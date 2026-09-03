@@ -14,6 +14,7 @@ Run it with:  python export_excel.py      (after sync_robinhood.py)
 
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -447,6 +448,202 @@ def build_overview_sheet(ws, trades_total_row, holdings_total_row,
 
 
 # =====================================================================
+# 7b. Performance — the interpreted numbers
+# =====================================================================
+
+def build_performance_sheet(ws, metrics: dict) -> None:
+    """
+    Return figures, drawdown, and the discretionary/autopilot split.
+
+    Unlike every other sheet here, these are VALUES rather than formulas.
+    TWR chains a growth factor across 239 rows and XIRR is an iterative
+    root-find; expressing either as a spreadsheet formula would mean
+    shipping a fragile array formula that Excel recalculates differently
+    from the Python. The workbook stays the record; this sheet is the
+    reading of it, computed once by analytics.py.
+
+    Each caveat sits next to its figure rather than in a footnote, for the
+    same reason it does in the dashboard: an annualised rate over a short
+    holding period is the kind of number that gets quoted out of context.
+    """
+    ws.cell(row=1, column=1, value="Performance").font = TITLE
+    ws.cell(row=2, column=1,
+            value=f"Computed {datetime.now():%Y-%m-%d %H:%M} from stored price "
+                  f"history. Values, not formulas — see the note at the bottom."
+            ).font = NOTE
+
+    row = [4]
+
+    def block(heading):
+        c = ws.cell(row=row[0], column=1, value=heading)
+        c.font = HEAD_FONT
+        c.fill = HEAD_FILL
+        for col in (2, 3):
+            ws.cell(row=row[0], column=col).fill = HEAD_FILL
+        row[0] += 1
+
+    def line(label, value, fmt=MONEY, bold=False, comment=None):
+        ws.cell(row=row[0], column=1, value=label).font = BOLD if bold else BODY
+        c = ws.cell(row=row[0], column=2, value=value)
+        c.font = BOLD if bold else BODY
+        c.number_format = fmt
+        if comment:
+            ws.cell(row=row[0], column=3, value=comment).font = NOTE
+        row[0] += 1
+
+    def gap():
+        row[0] += 1
+
+    # --- position ------------------------------------------------------
+    block("Position")
+    line("Capital deployed", metrics["deployed"],
+         comment="Money put into positions — not transfers to the broker.")
+    line("Portfolio value", metrics["ending"])
+    line("Gain", metrics["ending"] - metrics["deployed"], bold=True)
+    if metrics["deployed"]:
+        line("Unweighted return",
+             metrics["ending"] / metrics["deployed"] - 1, PCT)
+    gap()
+
+    # --- returns -------------------------------------------------------
+    block("Returns")
+    if metrics["twr"] is not None:
+        line("Time-weighted (cumulative)", metrics["twr"], PCT, bold=True,
+             comment="Ignores when you added money — measures the picks.")
+    if metrics["twr_ann"] is not None:
+        line("Time-weighted (annualised)", metrics["twr_ann"], PCT)
+    if metrics["mwr"] is not None:
+        line("Return on deployed capital", metrics["mwr"], PCT, bold=True,
+             comment="Money-weighted (XIRR). Idle cash is invisible to it.")
+    if metrics["held_days"]:
+        caution = ("Short — annualising this stretch overstates a repeatable rate."
+                   if metrics["held_days"] < 180 else "")
+        line("Avg dollar invested", metrics["held_days"], INT,
+             comment=f"days. {caution}".strip())
+    line("Period measured", metrics["span_days"], INT, comment="days")
+    gap()
+
+    # --- drawdown ------------------------------------------------------
+    block("Drawdown")
+    if metrics["dd_depth"] is not None:
+        line("Worst decline", metrics["dd_depth"], PCT, bold=True)
+        line("Peak", metrics["dd_peak"] or "-", "General")
+        line("Trough", metrics["dd_trough"] or "-", "General")
+        line("Off peak now", metrics["dd_current"], PCT)
+    gap()
+
+    # --- realized quality ----------------------------------------------
+    rs = metrics["realized"]
+    block("Realized quality")
+    line("Net realized", rs["net"], bold=True,
+         comment="Gains minus losses — never a sum of magnitudes.")
+    line("Gross wins", rs["gross_wins"], comment=f"{rs['wins']} trades")
+    line("Gross losses", -rs["gross_losses"], comment=f"{rs['losses']} trades")
+    if rs["win_rate"] is not None:
+        line("Win rate", rs["win_rate"], PCT)
+    if rs["profit_factor"] is not None:
+        line("Profit factor", rs["profit_factor"], '0.00',
+             comment="Dollars won per dollar lost.")
+    gap()
+
+    # --- attribution ----------------------------------------------------
+    block("Discretionary vs automatic")
+    ws.cell(row=row[0], column=1, value="Stream").font = BOLD
+    ws.cell(row=row[0], column=2, value="Deployed").font = BOLD
+    ws.cell(row=row[0], column=3, value="Value now").font = BOLD
+    ws.cell(row=row[0], column=4, value="Gain").font = BOLD
+    ws.cell(row=row[0], column=5, value="Return").font = BOLD
+    for cell in ws[row[0]][:5]:
+        cell.border = TOP
+    row[0] += 1
+
+    labels = {"user": "You (discretionary)", "recurring": "Autopilot (recurring)"}
+    for entry in metrics["attribution"]:
+        ws.cell(row=row[0], column=1,
+                value=labels.get(entry["placed_agent"], entry["placed_agent"])
+                ).font = BODY
+        for col, key, fmt in ((2, "net_deployed", MONEY),
+                              (3, "ending_value", MONEY),
+                              (4, "gain", MONEY),
+                              (5, "return_pct", PCT)):
+            c = ws.cell(row=row[0], column=col, value=entry[key])
+            c.font = BODY
+            c.number_format = fmt
+        row[0] += 1
+
+    gap()
+    for text in (
+        "Each stream is valued as its own portfolio, so returns compare fairly "
+        "despite very different amounts of money. Indicative, not audited: a "
+        "recurring buy and a manual sell can touch the same shares.",
+        "Realized and unrealized are never added together. One is money "
+        "received; the other is a market estimate that changes daily.",
+        "These cells are values, not formulas: time-weighted return and XIRR "
+        "are iterative and do not survive translation into a spreadsheet "
+        "formula. Re-run export_excel.py after a sync to refresh them.",
+    ):
+        ws.cell(row=row[0], column=1, value=text).font = NOTE
+        row[0] += 1
+
+    ws.column_dimensions["A"].width = 28
+    for col in "BCDE":
+        ws.column_dimensions[col].width = 16
+    ws.column_dimensions["F"].width = 60
+
+
+def collect_performance() -> Optional[dict]:
+    """
+    Run the metrics engine over the stored history.
+
+    Returns None when there is not enough price history to say anything,
+    so the caller can skip the sheet rather than emit a page of dashes.
+    """
+    import pandas as pd
+
+    import analytics as an
+
+    with db.get_connection() as conn:
+        trades = pd.DataFrame([dict(r) for r in db.get_all_trades(conn)])
+        prices = pd.DataFrame([dict(r) for r in db.get_daily_prices(conn)])
+        opening = pd.DataFrame([dict(r) for r in db.get_opening_balances(conn)])
+        positions = pd.DataFrame([dict(r) for r in db.get_positions(conn)])
+        realized = pd.DataFrame([dict(r) for r in db.get_realized_pnl(conn)])
+
+    if trades.empty or prices.empty:
+        return None
+
+    value = an.portfolio_value(trades, prices, opening)
+    if value.empty or len(value) < 2:
+        return None
+
+    curve = value["value"]
+    flows = an.prepare_trades(trades).groupby("date")["cash_flow"].sum()
+    first, last = curve.index[0], curve.index[-1]
+    span_days = (pd.Timestamp(last) - pd.Timestamp(first)).days
+
+    twr = an.time_weighted_return(curve, flows)
+    dd = an.max_drawdown(curve)
+    attribution = an.attribution(trades, prices, opening)
+
+    return {
+        "deployed": float(flows.sum()),
+        "ending": float(curve.iloc[-1]),
+        "twr": twr,
+        "twr_ann": an.annualise(twr, span_days) if twr is not None else None,
+        "mwr": an.money_weighted_return(trades, float(curve.iloc[-1]), last),
+        "held_days": an.capital_weighted_holding_days(trades, last),
+        "span_days": span_days,
+        "dd_depth": dd["depth"],
+        "dd_peak": dd["peak_date"],
+        "dd_trough": dd["trough_date"],
+        "dd_current": dd["current"],
+        "realized": an.realized_summary(realized),
+        "unrealized": an.unrealized_summary(positions),
+        "attribution": attribution.to_dict("records"),
+    }
+
+
+# =====================================================================
 # 8. Entry point
 # =====================================================================
 
@@ -487,6 +684,18 @@ def export() -> None:
         wb.move_sheet(overview, offset=-len(wb.sheetnames) + 1)
         wb.active = 0
 
+    # Performance is computed rather than referenced, so it needs no row
+    # indices from the other sheets — but it does need price history, which
+    # only exists after a sync that captured it.
+    performance = collect_performance()
+    if performance:
+        build_performance_sheet(wb.create_sheet("Performance"), performance)
+        # Sits right after Overview: it answers "how am I doing", which is
+        # the second question after "where do I stand".
+        if "Overview" in wb.sheetnames:
+            wb.move_sheet("Performance",
+                          offset=-len(wb.sheetnames) + 2)
+
     wb.save(OUT_PATH)
 
     print(f"Wrote {OUT_PATH.name}")
@@ -495,6 +704,11 @@ def export() -> None:
           f"{'  (skipped — no snapshot)' if not positions else ''}")
     print(f"  Realized P&L      {len(realized):>4} closing trades"
           f"{'  (skipped — none synced)' if not realized else ''}")
+    if performance:
+        print(f"  Performance        TWR {performance['twr']:+.2%}, "
+              f"deployed ${performance['deployed']:,.0f}")
+    else:
+        print("  Performance          (skipped — no price history)")
     print("Formula cells have no cached values until Excel opens and "
           "recalculates the file.")
 

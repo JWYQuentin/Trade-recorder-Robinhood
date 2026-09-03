@@ -27,6 +27,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+import analytics as an
 import db
 
 ACCENT, GAIN, LOSS = "#1C5CAB", "#0F7A4A", "#B3261E"
@@ -166,9 +167,30 @@ def load_realized() -> pd.DataFrame:
         return pd.DataFrame([dict(r) for r in db.get_realized_pnl(conn)])
 
 
+@st.cache_data(ttl=30)
+def load_prices() -> pd.DataFrame:
+    with db.get_connection() as conn:
+        return pd.DataFrame([dict(r) for r in db.get_daily_prices(conn)])
+
+
+@st.cache_data(ttl=30)
+def load_opening() -> pd.DataFrame:
+    with db.get_connection() as conn:
+        return pd.DataFrame([dict(r) for r in db.get_opening_balances(conn)])
+
+
+@st.cache_data(ttl=30)
+def load_account() -> pd.DataFrame:
+    with db.get_connection() as conn:
+        return pd.DataFrame([dict(r) for r in db.get_portfolio_snapshots(conn)])
+
+
 trades = load_trades()
 positions = load_positions()
 realized = load_realized()
+prices = load_prices()
+opening = load_opening()
+account = load_account()
 
 SYNC_HINT = "Run `python sync_robinhood.py` in your terminal, then refresh."
 
@@ -252,7 +274,7 @@ def ranked_bars(frame, value_col, money_label, diverging=False):
         .properties(height=max(180, 26 * len(frame)))
         .configure_view(stroke=None)
     )
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
 
 def note(text):
@@ -271,8 +293,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_trades, tab_holdings, tab_realized = st.tabs(
-    ["Trades", "Holdings", "Realized P&L"]
+tab_trades, tab_holdings, tab_realized, tab_performance = st.tabs(
+    ["Trades", "Holdings", "Realized P&L", "Performance"]
 )
 
 
@@ -369,7 +391,7 @@ with tab_trades:
             filtered.assign(amount=gross)[
                 ["filled_at", "symbol", "side", "quantity", "average_price",
                  "amount", "fees", "placed_agent"]],
-            use_container_width=True, hide_index=True, height=420,
+            width="stretch", hide_index=True, height=420,
             column_config={
                 "filled_at": st.column_config.DatetimeColumn(
                     "Filled", format="YYYY-MM-DD HH:mm"),
@@ -434,7 +456,7 @@ with tab_holdings:
             h[["symbol", "quantity", "average_buy_price", "last_price",
                "cost_basis", "market_value", "unrealized", "unrealized_pct",
                "weight"]],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
             column_config={
                 "symbol": st.column_config.TextColumn("Symbol", width="small"),
                 "quantity": st.column_config.NumberColumn(
@@ -498,7 +520,7 @@ with tab_realized:
 
         section("By symbol")
         st.dataframe(
-            by_symbol, use_container_width=True, hide_index=True,
+            by_symbol, width="stretch", hide_index=True,
             column_config={
                 "symbol": st.column_config.TextColumn("Symbol", width="small"),
                 "closing_trades": st.column_config.NumberColumn("Trades"),
@@ -511,7 +533,7 @@ with tab_realized:
         st.dataframe(
             realized[["timestamp", "symbol", "quantity", "price",
                       "realized_gain"]],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
             column_config={
                 "timestamp": st.column_config.DatetimeColumn(
                     "Closed", format="YYYY-MM-DD HH:mm"),
@@ -526,3 +548,271 @@ with tab_realized:
         )
         note("Figures come from Robinhood's own realized-P&L endpoint, not "
              "recomputed here — informational, not a tax document.")
+
+
+# =====================================================================
+# Performance — how the money actually did
+# =====================================================================
+#
+# The other three tabs report WHAT HAPPENED. This one interprets it, which
+# means every figure here needs its caveat travelling with it rather than
+# sitting in a footnote nobody reads. Three in particular:
+#
+#   - Annualised MWR over a short effective holding period is arithmetically
+#     right and rhetorically misleading, so the holding period is shown
+#     beside it, not below it.
+#   - Realized and unrealized stay in separate blocks, never summed.
+#   - The recurring/manual split is indicative, not two audited accounts.
+# =====================================================================
+with tab_performance:
+    if trades.empty or prices.empty:
+        st.info(f"No price history yet. {SYNC_HINT}")
+    else:
+        value = an.portfolio_value(trades, prices, opening)
+        prepared = an.prepare_trades(trades)
+        flows = prepared.groupby("date")["cash_flow"].sum()
+
+        if value.empty or len(value) < 2:
+            st.info(f"Not enough price history to measure performance yet. {SYNC_HINT}")
+        else:
+            curve = value["value"]
+            first_day, last_day = curve.index[0], curve.index[-1]
+            span_days = (pd.Timestamp(last_day) - pd.Timestamp(first_day)).days
+
+            twr = an.time_weighted_return(curve, flows)
+            twr_ann = an.annualise(twr, span_days) if twr is not None else None
+            mwr = an.money_weighted_return(trades, float(curve.iloc[-1]), last_day)
+            held_days = an.capital_weighted_holding_days(trades, last_day)
+            deployed = float(flows.sum())
+            ending = float(curve.iloc[-1])
+
+            # --- headline: value against the capital that built it --------
+            left, right = st.columns([1, 1.6], gap="large")
+            with left:
+                statement("Position", [
+                    ("Capital deployed", money(deployed), None, False),
+                    ("Portfolio value", money(ending), None, False),
+                    ("Gain", tinted(ending - deployed), None, True),
+                    ("Unweighted", tinted(ending - deployed,
+                                          f"{(ending / deployed - 1):+.2%}")
+                     if deployed > 0 else "—", None, False),
+                ])
+                note("Capital deployed is money put into positions, not money "
+                     "transferred to the broker — Robinhood exposes no transfer "
+                     "history. Cash sitting uninvested is invisible here.")
+
+            with right:
+                section("Portfolio value against capital deployed")
+                # The GAP between these two lines is unrealized gain, read
+                # visually. Plotting them together beats a derived third
+                # line because it also shows the capital ramp that explains
+                # why the annualised figures below run hot.
+                basis = flows.reindex(curve.index, fill_value=0.0).cumsum()
+                chart_data = pd.DataFrame({
+                    "Portfolio value": curve,
+                    "Capital deployed": basis,
+                }).reset_index().rename(columns={"index": "date"})
+                chart_data["date"] = pd.to_datetime(chart_data["date"])
+                melted = chart_data.melt("date", var_name="series",
+                                         value_name="amount")
+                line = (
+                    alt.Chart(melted)
+                    .mark_line(strokeWidth=1.6)
+                    .encode(
+                        x=alt.X("date:T", title=None,
+                                axis=alt.Axis(grid=False, domain=False,
+                                              labelColor="#6B6B66")),
+                        y=alt.Y("amount:Q", title=None,
+                                axis=alt.Axis(format="$,.0f", grid=True,
+                                              gridColor="#EDEDE8", domain=False,
+                                              labelColor="#6B6B66")),
+                        color=alt.Color("series:N", title=None,
+                                        scale=alt.Scale(
+                                            domain=["Portfolio value",
+                                                    "Capital deployed"],
+                                            range=[ACCENT, "#A8A8A2"]),
+                                        legend=alt.Legend(orient="top-left",
+                                                          labelColor="#1A1A18")),
+                        tooltip=[alt.Tooltip("date:T", title="Date"),
+                                 alt.Tooltip("series:N", title=""),
+                                 alt.Tooltip("amount:Q", title="Amount",
+                                             format="$,.2f")],
+                    )
+                    .properties(height=280)
+                    .configure_view(stroke=None)
+                )
+                st.altair_chart(line, width="stretch")
+                note("The gap between the lines is unrealized gain. Where the "
+                     "grey line steps up, capital was added — that is a "
+                     "deposit, not performance.")
+
+            st.divider()
+
+            # --- the two returns, and why they differ --------------------
+            col_twr, col_mwr, col_dd = st.columns(3, gap="large")
+
+            with col_twr:
+                statement("Time-weighted return", [
+                    ("Cumulative", tinted(twr or 0, f"{twr:+.2%}")
+                     if twr is not None else "—", None, True),
+                    ("Annualised", tinted(twr_ann or 0, f"{twr_ann:+.2%}")
+                     if twr_ann is not None else "—", None, False),
+                    ("Period", f"{span_days} days", None, False),
+                ])
+                note("Strips out when you added money, so it measures the "
+                     "picks. This is what a fund quotes.")
+
+            with col_mwr:
+                statement("Return on deployed capital", [
+                    ("Annualised (MWR)", tinted(mwr or 0, f"{mwr:+.2%}")
+                     if mwr is not None else "—", None, True),
+                    ("Avg dollar invested",
+                     f"{held_days:,.0f} days" if held_days else "—", None, False),
+                ])
+                if held_days and held_days < 180:
+                    note(f"⚠︎ Read with care. The average dollar has been "
+                         f"invested {held_days:,.0f} days, so this annualises a "
+                         f"short stretch — correct arithmetic, but not a rate "
+                         f"you should expect to repeat.")
+                else:
+                    note("Weights by how much was invested when, so it "
+                         "measures your outcome rather than the picks.")
+
+            with col_dd:
+                dd = an.max_drawdown(curve)
+                depth, current = dd["depth"], dd["current"]
+                statement("Drawdown", [
+                    ("Worst decline", tinted(depth or 0, f"{depth:.2%}")
+                     if depth is not None else "—", None, True),
+                    ("Peak to trough",
+                     f"{dd['peak_date']} → {dd['trough_date']}"
+                     if dd["peak_date"] else "—", None, False),
+                    ("Off peak now", tinted(current or 0, f"{current:.2%}")
+                     if current is not None else "—", None, False),
+                ])
+                note("Worst peak-to-trough fall in portfolio value. Early "
+                     "readings flatter: while contributions dominate, almost "
+                     "every day sets a new high.")
+
+            if twr is not None and mwr is not None:
+                verdict = ("Your timing helped: money was working hardest while "
+                           "the portfolio rose."
+                           if mwr > (twr_ann or twr) else
+                           "Your timing cost you: more money was invested during "
+                           "the weaker stretches than the strong ones.")
+                note(f"**Why the two differ.** {verdict} Time-weighted ignores "
+                     f"contribution timing; money-weighted does not.")
+
+            st.divider()
+
+            # --- realized vs unrealized, deliberately not summed ---------
+            rs = an.realized_summary(realized)
+            us = an.unrealized_summary(positions)
+
+            col_r, col_u = st.columns(2, gap="large")
+            with col_r:
+                statement("Realized — money already received", [
+                    ("Net", tinted(rs["net"]), None, True),
+                    ("Gross wins", tinted(rs["gross_wins"]),
+                     f"{rs['wins']} trades", False),
+                    ("Gross losses", tinted(-rs["gross_losses"]),
+                     f"{rs['losses']} trades", False),
+                    ("Win rate",
+                     f"{rs['win_rate']:.0%}" if rs["win_rate"] is not None else "—",
+                     None, False),
+                    ("Profit factor",
+                     f"{rs['profit_factor']:.2f}"
+                     if rs["profit_factor"] is not None else "—",
+                     "$ won per $ lost", False),
+                ])
+                if rs["gross_losses"] > 0 and rs["net"] != 0:
+                    ratio = (rs["gross_wins"] + rs["gross_losses"]) / abs(rs["net"])
+                    if ratio > 3:
+                        note(f"The net is a small difference between much larger "
+                             f"gross figures ({money(rs['gross_wins'])} won against "
+                             f"{money(rs['gross_losses'])} lost), so it is noisier "
+                             f"than the single number suggests.")
+
+            with col_u:
+                statement("Unrealized — a market estimate", [
+                    ("Cost basis", money(us["cost_basis"]), None, False),
+                    ("Market value", money(us["market_value"]), None, False),
+                    ("Unrealized P&L", tinted(us["unrealized"]), None, True),
+                    ("Return",
+                     tinted(us["unrealized"], f"{us['return_pct']:+.2%}")
+                     if us["return_pct"] is not None else "—", None, False),
+                ])
+                note("Not money you have. It moves every day and is never "
+                     "added to the realized figure above.")
+
+            st.divider()
+
+            # --- the question this account can uniquely answer -----------
+            section("Discretionary trading against automatic investing")
+            attribution = an.attribution(trades, prices, opening)
+            if attribution.empty:
+                note("No placed_agent information on these trades.")
+            else:
+                labels = {"user": "You (discretionary)",
+                          "recurring": "Autopilot (recurring)",
+                          "unknown": "Unattributed"}
+                display = attribution.copy()
+                display["Stream"] = display["placed_agent"].map(
+                    lambda a: labels.get(a, a))
+                st.dataframe(
+                    display[["Stream", "fills", "net_deployed", "ending_value",
+                             "gain", "return_pct"]],
+                    width="stretch", hide_index=True,
+                    column_config={
+                        "Stream": st.column_config.TextColumn("Stream"),
+                        "fills": st.column_config.NumberColumn("Fills", format="%d"),
+                        "net_deployed": st.column_config.NumberColumn(
+                            "Capital deployed", format="dollar"),
+                        "ending_value": st.column_config.NumberColumn(
+                            "Value now", format="dollar"),
+                        "gain": st.column_config.NumberColumn("Gain", format="dollar"),
+                        "return_pct": st.column_config.NumberColumn(
+                            "Return", format="percent"),
+                    },
+                )
+                note("Each stream is valued as if it were its own portfolio, so "
+                     "the returns are comparable despite very different amounts "
+                     "of money. **Indicative, not audited:** a recurring buy and "
+                     "a manual sell can touch the same shares, so the two streams "
+                     "are not fully independent. Note also that fill counts run "
+                     "opposite to the money — most fills are small recurring buys.")
+
+            by_agent = an.realized_by_agent(trades, realized)
+            if not by_agent.empty:
+                section("Who booked the realized gains")
+                for _, row in by_agent.iterrows():
+                    label = {"user": "You (discretionary)",
+                             "recurring": "Autopilot (recurring)",
+                             "unmatched": "Unmatched to a sell"}.get(
+                        row["placed_agent"], row["placed_agent"])
+                    st.markdown(
+                        f'<div class="stmt-row"><span class="stmt-label">{label}'
+                        f'</span><span class="stmt-val">{tinted(row["realized"])}'
+                        f'<span class="stmt-note">{int(row["trades"])} closing '
+                        f'trades</span></span></div>',
+                        unsafe_allow_html=True)
+                note("Attributed to whoever placed the sell — the decision that "
+                     "books the gain.")
+
+            # --- cash drag, once there is a series to show ---------------
+            if not account.empty and account["cash"].notna().any():
+                latest = account.iloc[-1]
+                cash, equity = latest["cash"] or 0, latest["equity_value"] or 0
+                if cash > 0 and equity > 0:
+                    st.divider()
+                    section("Cash")
+                    share = cash / (cash + equity)
+                    statement("Uninvested", [
+                        ("Cash", money(cash), f"{share:.1%} of account", True),
+                        ("Equity", money(equity), None, False),
+                    ])
+                    note(f"Uninvested cash earns nothing but counts as capital "
+                         f"you committed. It is excluded from the return figures "
+                         f"above, which therefore flatter you by however long it "
+                         f"has sat idle. Recorded only from the first sync that "
+                         f"captured it — Robinhood serves no history for this.")

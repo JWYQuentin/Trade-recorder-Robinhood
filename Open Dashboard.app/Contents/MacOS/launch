@@ -1,0 +1,68 @@
+#!/bin/bash
+#
+# Trade Dashboard launcher.
+#
+# Double-click to open the dashboard. Starts Streamlit if it isn't already
+# running, then opens the browser. Double-clicking again while it's running
+# just reopens the tab rather than starting a second server.
+#
+# The project folder is resolved from this app's own location, so moving the
+# whole folder keeps it working — unlike the LaunchAgent, which stores
+# absolute paths.
+
+PORT=8501
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+URL="http://localhost:$PORT"
+LOG="$APP_DIR/dashboard.log"
+
+notify() {
+    /usr/bin/osascript -e "display notification \"$2\" with title \"$1\"" \
+        >/dev/null 2>&1
+}
+
+fail() {
+    /usr/bin/osascript -e "display alert \"Trade Dashboard\" message \"$1\" as critical" \
+        >/dev/null 2>&1
+    exit 1
+}
+
+cd "$APP_DIR" || fail "Could not find the Trade Recorder folder."
+
+[ -x "./venv/bin/streamlit" ] || fail \
+"Streamlit isn't installed in this folder's virtual environment.
+
+Open Terminal in the Trade Recorder folder and run:
+    python3 -m venv venv
+    ./venv/bin/pip install -r requirements.txt"
+
+[ -f "./app.py" ] || fail "app.py is missing from $APP_DIR."
+
+# Already serving? Just reopen the tab.
+if /usr/bin/curl -s -o /dev/null --max-time 2 "$URL"; then
+    /usr/bin/open "$URL"
+    exit 0
+fi
+
+notify "Trade Dashboard" "Starting up — your browser will open shortly."
+
+# Streamlit opens the browser itself on first start.
+nohup ./venv/bin/streamlit run app.py \
+    --server.port "$PORT" \
+    --browser.gatherUsageStats false \
+    > "$LOG" 2>&1 &
+
+# Wait for the server to answer before deciding whether it worked. Streamlit
+# takes a few seconds; 30 is generous enough for a cold start on battery.
+for _ in $(seq 1 60); do
+    sleep 0.5
+    if /usr/bin/curl -s -o /dev/null --max-time 2 "$URL"; then
+        # It opens its own tab, but do it explicitly in case the browser
+        # setting is off — open on an existing tab is harmless.
+        /usr/bin/open "$URL"
+        exit 0
+    fi
+done
+
+fail "The dashboard didn't start within 30 seconds.
+
+Check the end of dashboard.log in the Trade Recorder folder for the reason."

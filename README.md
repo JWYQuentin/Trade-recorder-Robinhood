@@ -2,11 +2,13 @@
 
 A small local Mac app that records your Robinhood **equity** activity into a
 local SQLite database, shows it in a Streamlit dashboard, and exports it to
-Excel. It tracks three separate things:
+Excel. It tracks four separate things:
 
 - **Trades** — every filled order, immutable history.
 - **Holdings** — what you own right now, and the gain you haven't taken yet.
 - **Realized P&L** — the gain you *have* taken, on positions already closed.
+- **Performance** — how the money actually did: time- and money-weighted
+  returns, drawdown, and whether your own trades beat your automatic ones.
 
 **Scope — deliberately narrow:**
 
@@ -22,9 +24,12 @@ Excel. It tracks three separate things:
 | `db.py` | Creates/migrates `trades.db`, idempotent inserts, snapshot swaps |
 | `models.py` | `Trade` dataclass + raw-order → `Trade` normalization |
 | `sync_robinhood.py` | Fetches orders, positions and realized P&L (mock or real) |
-| `app.py` | Streamlit dashboard — Trades / Holdings / Realized P&L tabs |
+| `analytics.py` | Metrics engine — returns, drawdown, attribution. Pure functions, no I/O |
+| `app.py` | Streamlit dashboard — Trades / Holdings / Realized P&L / Performance tabs |
 | `export_excel.py` | Writes `trading record.xlsx` from the database |
-| `Trade Dashboard.command` | Double-click from Finder to open the dashboard |
+| `tests/` | pytest suite — metric unit tests plus a live-data reconciliation check |
+| `Open Dashboard.app` | Double-click (or keep in the Dock) to open the dashboard |
+| `Trade Dashboard.command` | The older Finder launcher; still works |
 | `.env.example` | Config template — copy to `.env` |
 
 ## 1. Install
@@ -132,9 +137,11 @@ can't make the dashboard read as though you own nothing.
 streamlit run app.py
 ```
 
-Or double-click **`Trade Dashboard.command`** in Finder.
+Or double-click **`Open Dashboard.app`** — it can live in your Dock, reuses an
+already-running server instead of starting a second one, and reports problems in
+a readable alert rather than a stack trace.
 
-Three tabs:
+Four tabs:
 
 - **Trades** — every fill, filterable by symbol, side, date range, and *placed
   by*. That last one separates manual trades from automated recurring buys, which
@@ -142,6 +149,9 @@ Three tabs:
   Invested / Proceeds / Fees plus a cumulative-net-invested chart.
 - **Holdings** — positions, cost basis, market value, unrealized P&L.
 - **Realized P&L** — total, per-symbol breakdown, and every closing trade.
+- **Performance** — portfolio value against the capital that built it, time- and
+  money-weighted returns, drawdown, realized quality (win rate, profit factor),
+  and a split of discretionary trades against automatic ones.
 
 Realized and unrealized are kept apart on purpose. One is money already received;
 the other is a market estimate that changes daily. The dashboard never adds them.
@@ -155,11 +165,12 @@ priced as of the last sync, so they drift with the market between runs.
 python export_excel.py      # writes "trading record.xlsx"
 ```
 
-Five sheets:
+Six sheets:
 
 | Sheet | What's on it |
 |---|---|
 | **Overview** | Where you stand, in one screen — all cross-sheet formulas |
+| **Performance** | Returns, drawdown, and the discretionary/automatic split |
 | **Trades** | One row per fill, with an autofilter |
 | **Summary by Symbol** | Per-symbol totals over the Trades sheet |
 | **Holdings** | Positions, unrealized P&L, and % of portfolio |
@@ -173,7 +184,65 @@ if no snapshot has been synced yet, rather than emitting empty sheets.
 > Formula cells hold no cached values until Excel opens the file. Reading the
 > workbook with pandas before its first open in Excel yields empty columns.
 
-## 6. Keep it synced automatically
+## 6. Reading the Performance tab
+
+Two returns are shown, and they are meant to disagree.
+
+**Time-weighted return** ignores when you added money, so it measures the
+*picks*. This is the figure a fund quotes, and the fair one for comparing
+against an index.
+
+**Return on deployed capital** (money-weighted, XIRR) weights by how much was
+invested when, so it measures *your outcome*. When it beats the time-weighted
+figure, your contribution timing helped.
+
+Three caveats are shown beside the numbers rather than buried here, because each
+one is easy to quote out of context:
+
+- **Annualising a short holding period overstates things.** If most of your money
+  arrived recently, the average dollar has been invested for only a few months,
+  and annualising that stretch produces a rate you should not expect to repeat.
+  The tab warns you whenever the capital-weighted holding period is under 180
+  days.
+- **"Deployed capital" is not "money you transferred."** Robinhood's MCP exposes
+  no transfer or ACH history, so cash sitting uninvested is invisible to the
+  return figures. It is reported separately at the bottom of the tab so the gap
+  stays visible.
+- **The discretionary/automatic split is indicative, not audited.** A recurring
+  buy and a manual sell can touch the same shares, so the two streams are not
+  fully independent.
+
+Realized and unrealized are never added together, here or anywhere else.
+
+### The history floor
+
+Robinhood serves no order history before **2025-09-22** (verified with an
+unbounded query). That is the start of the record, not a bug. Any position opened
+before that date has no buy to replay, so `opening_balances` seeds the missing
+shares; those symbols have correct dollar figures but unreliable *percentage*
+returns, and the app says so rather than showing a confident wrong number.
+
+## 7. Check the numbers are trustworthy
+
+```bash
+python -m pytest tests/ -q
+```
+
+Two suites:
+
+- **`test_analytics.py`** — unit tests for the metrics, against hand-computed
+  fixtures rather than whatever the code happens to produce. XIRR is checked
+  against known answers and against its defining property (NPV at the solved rate
+  must be zero).
+- **`test_reconciliation.py`** — runs against your *live* database. It asserts
+  that replaying every stored trade reproduces the share counts Robinhood itself
+  reports, and that pricing them lands within one session's drift of reported
+  equity.
+
+That second suite is the one that matters. If it fails, every figure on the
+Performance tab is suspect, and it should be fixed before anything else.
+
+## 8. Keep it synced automatically
 
 Duplicates are impossible thanks to the `UNIQUE` constraint on
 `robinhood_order_id`, so re-running is always safe.
@@ -232,6 +301,24 @@ it can look unlike your trade history for a position you've mostly sold.
 Replaced rather than appended because Robinhood returns the complete set every
 time and gives no stable per-row id.
 
+**History tables** — added so performance can be measured over time, since
+`positions` is overwritten on every sync and keeps no past:
+
+- **`position_snapshots`** — append-only archive of every positions swap, keyed
+  `(snapshot_at, symbol)`.
+- **`daily_prices`** — daily closes, keyed `(symbol, date)`. Fetched for every
+  symbol *ever* traded, not just those currently held: valuing the portfolio on a
+  past date needs prices for positions since closed. Backfilled once, then topped
+  up incrementally.
+- **`portfolio_snapshots`** — account equity and cash per sync. Appended, never
+  replaced. There is no historical version of this endpoint, so the cash series
+  necessarily starts from the first sync that recorded it.
+- **`tax_lots`** — Robinhood's own per-lot cost basis, with `open_date` and
+  short/long-term `term`. Replaced each sync, like `positions`.
+- **`opening_balances`** — shares held before the 2025-09-22 history floor that
+  no stored trade accounts for. Seeded once; cost basis is left NULL because it
+  is genuinely unknowable.
+
 `get_connection()` migrates an older database automatically: any missing column
 is added and backfilled from `raw_json`, once, with no re-sync needed. Note that
 `ALTER TABLE` appends, so a migrated database has the newer columns *after*
@@ -246,7 +333,7 @@ position, so it doesn't matter.
 - **`.rh_tokens.json`** — live OAuth credentials to your brokerage account
 - **`trades.db`** (and any `.bak`) — your complete trading history
 - **`trading record.xlsx`** — same data, different format
-- **`sync.log`** — holds your holdings and P&L figures
+- **`sync.log`** (and `sync.log.1`) — holds your holdings and P&L figures
 
 ## Troubleshooting
 
@@ -269,4 +356,14 @@ position, so it doesn't matter.
   *old* location until you do, so look there first.
 - **`git push` fails with an HTTP2 framing error** → a local proxy is mangling
   HTTP/2. `git config http.version HTTP/1.1` fixes it.
-- **Reset everything** → delete `trades.db` and re-run the sync.
+- **Performance tab says "no price history"** → run the sync; it backfills daily
+  closes. Mock mode does not produce them.
+- **Reconstructed value differs from Holdings by 1-2%** → expected. Daily bars
+  carry the previous session's close while Holdings uses a live quote, so the two
+  are legitimately a day apart. A much larger gap means something is wrong, and
+  `pytest tests/` will say so.
+- **`sync.log` got large** → it rotates itself to `sync.log.1` past ~1 MB, at the
+  start of a run. Nothing to do.
+- **Reset everything** → delete `trades.db` and re-run the sync. Note this also
+  discards the price history and snapshot archive, which the sync will refetch —
+  except `portfolio_snapshots`, whose cash series cannot be recovered.

@@ -853,6 +853,38 @@ class RobinhoodMCPSource:
 # 5. The sync itself
 # =====================================================================
 
+# The scheduled job appends every run's output to sync.log forever. Rotation
+# has to happen here rather than in the plist: launchd holds the file open for
+# the whole run, so anything that truncates it mid-run loses the current
+# output. Rotating BEFORE the work starts sidesteps that — the handle launchd
+# opens after this point is a fresh file.
+LOG_PATH = Path(__file__).parent / "sync.log"
+LOG_MAX_BYTES = 1_000_000      # ~1 MB, roughly a year of 6-hourly runs
+LOG_KEEP = "sync.log.1"        # one generation back; older is not useful
+
+
+def rotate_log() -> None:
+    """
+    Move sync.log aside once it passes LOG_MAX_BYTES.
+
+    Deliberately not logging.handlers.RotatingFileHandler: nothing here uses
+    the logging module, and the file is written by launchd's stdout redirect
+    rather than by Python, so a handler would never see it.
+
+    Any failure is swallowed. A log that cannot be rotated is a nuisance; a
+    sync that dies because of one would be a real problem.
+    """
+    try:
+        if not LOG_PATH.exists() or LOG_PATH.stat().st_size < LOG_MAX_BYTES:
+            return
+        previous = LOG_PATH.parent / LOG_KEEP
+        previous.unlink(missing_ok=True)
+        LOG_PATH.rename(previous)
+        print(f"(rotated sync.log to {LOG_KEEP})")
+    except OSError as exc:
+        print(f"(could not rotate sync.log: {exc})")
+
+
 def run_sync() -> None:
     """Fetch orders, keep the fills, insert new ones into SQLite."""
     source_name = os.getenv("DATA_SOURCE", "mock").lower()
@@ -950,4 +982,5 @@ def run_sync() -> None:
 
 
 if __name__ == "__main__":
+    rotate_log()
     run_sync()

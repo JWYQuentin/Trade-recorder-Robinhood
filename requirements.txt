@@ -2,6 +2,16 @@
 streamlit>=1.35
 pandas>=2.0
 
+# Charting. Ships as a Streamlit dependency, but app.py imports it directly
+# (st.bar_chart sorts its category axis alphabetically, which destroys the
+# only reading the ranked charts exist for), so it is declared here rather
+# than relied on transitively.
+altair>=5.0
+
+# Numeric helpers in analytics.py — drawdown masking, NaN handling. Arrives
+# with pandas, but again: imported directly, so declared directly.
+numpy>=1.24
+
 # Reads config (MCP URL, data source choice) from the .env file
 python-dotenv>=1.0
 
@@ -9,5 +19,15 @@ python-dotenv>=1.0
 # Not needed if you only run in mock mode.
 mcp>=1.0
 
+# Used directly by sync_robinhood.py to pre-fetch Robinhood's OAuth
+# metadata before the MCP session starts. Comes in with mcp, but the
+# import is ours.
+httpx>=0.27
+
 # Writes the Excel export (export_excel.py)
 openpyxl>=3.1
+
+# Test suite (tests/). Not needed to run the app — install with:
+#     pip install -r requirements.txt
+# and it comes along; skip it only if you never run pytest.
+pytest>=8.0

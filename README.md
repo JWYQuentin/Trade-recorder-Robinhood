@@ -149,9 +149,10 @@ Four tabs:
   Invested / Proceeds / Fees plus a cumulative-net-invested chart.
 - **Holdings** — positions, cost basis, market value, unrealized P&L.
 - **Realized P&L** — total, per-symbol breakdown, and every closing trade.
-- **Performance** — portfolio value against the capital that built it, time- and
-  money-weighted returns, drawdown, realized quality (win rate, profit factor),
-  and a split of discretionary trades against automatic ones.
+- **Performance** — portfolio value against the capital that built it, a
+  comparison against SPY, time- and money-weighted returns, drawdown, realized
+  quality (win rate, profit factor), and a split of discretionary trades against
+  automatic ones.
 
 Realized and unrealized are kept apart on purpose. One is money already received;
 the other is a market estimate that changes daily. The dashboard never adds them.
@@ -211,6 +212,25 @@ one is easy to quote out of context:
 - **The discretionary/automatic split is indicative, not audited.** A recurring
   buy and a manual sell can touch the same shares, so the two streams are not
   fully independent.
+
+### The benchmark comparison
+
+The index comparison answers "would I have done better doing nothing clever?"
+by replaying your own cash flows into SPY: **every dollar you put into a
+position, on the day you put it in, buying the index instead.**
+
+That construction matters. Comparing your return against SPY's headline return
+for the period would assume all your money was invested from day one — badly
+wrong for a portfolio built by irregular contributions and recurring buys, and
+it can flatter or punish you by many percentage points depending on when your
+capital actually arrived.
+
+Dividends are excluded on both sides. The portfolio's own price history is
+price-return, so reinvesting them for the index only would hand it a ~1.2%/yr
+advantage the portfolio never gets.
+
+Change `BENCHMARK_SYMBOL` in `db.py` to compare against something else; it is
+stored in `daily_prices` like any other symbol and fetched automatically.
 
 Realized and unrealized are never added together, here or anywhere else.
 

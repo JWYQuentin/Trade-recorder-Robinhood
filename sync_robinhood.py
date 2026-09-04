@@ -951,6 +951,10 @@ def run_sync() -> None:
         n_arch = db.archive_positions(conn, positions, as_of)
         symbols = sorted({r["symbol"] for r in conn.execute(
             "SELECT DISTINCT symbol FROM trades")})
+    # The benchmark is priced like any other symbol, but is never traded, so
+    # it has to be added explicitly rather than discovered from trade history.
+    if db.BENCHMARK_SYMBOL not in symbols:
+        symbols.append(db.BENCHMARK_SYMBOL)
     if n_arch:
         print(f"  archived {n_arch} position(s) to the history table.")
 

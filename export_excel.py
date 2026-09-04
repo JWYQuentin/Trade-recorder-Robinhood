@@ -523,6 +523,26 @@ def build_performance_sheet(ws, metrics: dict) -> None:
     line("Period measured", metrics["span_days"], INT, comment="days")
     gap()
 
+    # --- benchmark ------------------------------------------------------
+    bench = metrics.get("benchmark")
+    if bench:
+        block(f"Against {bench['symbol']}")
+        line("Your portfolio", bench["portfolio_value"],
+             comment=f"{bench['portfolio_return']:+.2%} on deployed capital")
+        line(f"Same $ into {bench['symbol']}", bench["benchmark_value"],
+             comment=f"{bench['benchmark_return']:+.2%}")
+        line("Ahead by" if bench["difference"] >= 0 else "Behind by",
+             bench["difference"], bold=True,
+             comment=f"{bench['excess_return']:+.2%} excess")
+        ws.cell(row=row[0], column=1,
+                value="Every dollar put into a position, on the day it went in, "
+                      "buying the index instead. Comparing against the index's "
+                      "headline return would assume all the money was invested "
+                      "from day one. Dividends excluded on both sides."
+                ).font = NOTE
+        row[0] += 1
+        gap()
+
     # --- drawdown ------------------------------------------------------
     block("Drawdown")
     if metrics["dd_depth"] is not None:
@@ -640,6 +660,8 @@ def collect_performance() -> Optional[dict]:
         "realized": an.realized_summary(realized),
         "unrealized": an.unrealized_summary(positions),
         "attribution": attribution.to_dict("records"),
+        "benchmark": an.benchmark_comparison(trades, prices, curve,
+                                             db.BENCHMARK_SYMBOL),
     }
 
 

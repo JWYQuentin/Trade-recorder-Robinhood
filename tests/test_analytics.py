@@ -332,3 +332,86 @@ def test_realized_by_agent_flags_unmatched_rows():
                              "symbol": ["ZZZ"], "realized_gain": [50.0]})
     result = an.realized_by_agent(trades, realized).set_index("placed_agent")
     assert result.loc["unmatched", "realized"] == pytest.approx(50.0)
+
+
+# ------------------------------------------------------------ Benchmark
+
+def test_benchmark_buys_shares_with_the_same_cash():
+    """$1000 in at $100/share = 10 shares; at $200 later it's worth $2000."""
+    trades = make_trades([("2025-01-02T15:00:00Z", "AAA", "buy", 10, 100.0, 0)])
+    prices = make_prices([("2025-01-02", "SPY", 100.0),
+                          ("2025-01-03", "SPY", 200.0)])
+    curve = an.benchmark_curve(trades, prices, "SPY")
+    assert curve.loc["2025-01-02", "shares"] == pytest.approx(10.0)
+    assert curve.loc["2025-01-03", "value"] == pytest.approx(2000.0)
+
+
+def test_benchmark_sells_on_an_outflow():
+    """Taking money out of the portfolio sells the equivalent index dollars."""
+    trades = make_trades([
+        ("2025-01-02T15:00:00Z", "AAA", "buy", 10, 100.0, 0),   # +$1000
+        ("2025-01-03T15:00:00Z", "AAA", "sell", 5, 100.0, 0),   # -$500
+    ])
+    prices = make_prices([("2025-01-02", "SPY", 100.0),
+                          ("2025-01-03", "SPY", 100.0)])
+    curve = an.benchmark_curve(trades, prices, "SPY")
+    # 10 shares bought, 5 sold back at the same price.
+    assert curve.loc["2025-01-03", "shares"] == pytest.approx(5.0)
+    assert curve.loc["2025-01-03", "invested"] == pytest.approx(500.0)
+
+
+def test_benchmark_respects_contribution_timing():
+    """
+    The whole point: money that arrived after a rise does NOT get credited
+    with that rise. Buying $100 of index at 200 gets half a share, not the
+    return from 100.
+    """
+    trades = make_trades([("2025-01-03T15:00:00Z", "AAA", "buy", 1, 100.0, 0)])
+    prices = make_prices([("2025-01-02", "SPY", 100.0),
+                          ("2025-01-03", "SPY", 200.0)])
+    curve = an.benchmark_curve(trades, prices, "SPY")
+    assert curve.loc["2025-01-03", "shares"] == pytest.approx(0.5)
+    assert curve.loc["2025-01-03", "value"] == pytest.approx(100.0)
+
+
+def test_benchmark_flow_on_a_closed_market_day_is_not_lost():
+    """A fill dated on a holiday must roll into the next trading day."""
+    trades = make_trades([("2025-01-04T15:00:00Z", "AAA", "buy", 1, 100.0, 0)])
+    prices = make_prices([("2025-01-03", "SPY", 100.0),
+                          ("2025-01-06", "SPY", 100.0)])   # 4th/5th closed
+    curve = an.benchmark_curve(trades, prices, "SPY")
+    assert curve.loc["2025-01-06", "invested"] == pytest.approx(100.0)
+    assert curve.loc["2025-01-06", "shares"] == pytest.approx(1.0)
+
+
+def test_benchmark_comparison_reports_the_gap():
+    """Portfolio beat the index: difference and excess must both be positive."""
+    trades = make_trades([("2025-01-02T15:00:00Z", "AAA", "buy", 10, 100.0, 0)])
+    prices = make_prices([("2025-01-02", "SPY", 100.0),
+                          ("2025-01-03", "SPY", 110.0)])
+    portfolio = pd.Series({"2025-01-02": 1000.0, "2025-01-03": 1500.0})
+    result = an.benchmark_comparison(trades, prices, portfolio, "SPY")
+    assert result["benchmark_value"] == pytest.approx(1100.0)
+    assert result["portfolio_value"] == pytest.approx(1500.0)
+    assert result["difference"] == pytest.approx(400.0)
+    assert result["benchmark_return"] == pytest.approx(0.10)
+    assert result["portfolio_return"] == pytest.approx(0.50)
+    assert result["excess_return"] == pytest.approx(0.40)
+
+
+def test_benchmark_comparison_reports_underperformance():
+    """Losing to the index must read as a negative difference, not an absolute."""
+    trades = make_trades([("2025-01-02T15:00:00Z", "AAA", "buy", 10, 100.0, 0)])
+    prices = make_prices([("2025-01-02", "SPY", 100.0),
+                          ("2025-01-03", "SPY", 130.0)])
+    portfolio = pd.Series({"2025-01-02": 1000.0, "2025-01-03": 1100.0})
+    result = an.benchmark_comparison(trades, prices, portfolio, "SPY")
+    assert result["difference"] == pytest.approx(-200.0)
+    assert result["excess_return"] < 0
+
+
+def test_benchmark_comparison_none_without_prices():
+    trades = make_trades([("2025-01-02T15:00:00Z", "AAA", "buy", 10, 100.0, 0)])
+    prices = make_prices([("2025-01-02", "AAA", 100.0)])   # no SPY
+    portfolio = pd.Series({"2025-01-02": 1000.0})
+    assert an.benchmark_comparison(trades, prices, portfolio, "SPY") is None

@@ -436,6 +436,114 @@ def realized_by_symbol(realized: pd.DataFrame) -> pd.DataFrame:
 
 
 # =====================================================================
+# Benchmark: what if the same money had just bought the index?
+# =====================================================================
+#
+# The counterfactual is deliberately simple and stated plainly, because a
+# benchmark that quietly flatters either side is worse than none:
+#
+#   On every day you put money into positions, buy that many dollars of the
+#   index instead. On every day you took money out, sell that many dollars.
+#   Then compare what the two piles are worth today.
+#
+# This is the honest comparison for someone making irregular contributions.
+# Comparing your return against "SPY's return over the period" would NOT be
+# honest — it silently assumes you had all your money invested from day one,
+# which for most people (and certainly for a portfolio built by recurring
+# buys) is badly wrong.
+#
+# Fractional shares are assumed, which is how Robinhood works anyway.
+# Dividends are NOT reinvested on either side: the portfolio's own price
+# history is price-return too, so excluding them keeps the comparison
+# like-for-like rather than handing the index a ~1.2%/yr advantage the
+# portfolio doesn't get.
+# =====================================================================
+
+def benchmark_curve(trades: pd.DataFrame, prices: pd.DataFrame,
+                    symbol: str = "SPY") -> pd.DataFrame:
+    """
+    Value of an index position built from the same cash flows as `trades`.
+
+    Returns a frame indexed by date with `shares`, `value` and `invested`
+    (cumulative net cash deployed), aligned to the benchmark's price
+    calendar. Empty if the benchmark has no stored prices.
+    """
+    bench = prices[prices["symbol"] == symbol]
+    if bench.empty or trades.empty:
+        return pd.DataFrame(columns=["shares", "value", "invested"])
+
+    closes = (bench.set_index("date")["close"].sort_index())
+    closes.index = _date_strings(closes.index)
+    closes = closes[~closes.index.duplicated(keep="last")]
+
+    prepared = prepare_trades(trades)
+    flows = prepared.groupby("date")["cash_flow"].sum()
+    flows.index = _date_strings(flows.index)
+    flows = flows.groupby(level=0).sum()
+
+    calendar = closes.index
+    aligned = flows.reindex(calendar, fill_value=0.0)
+
+    # A flow dated on a market holiday would be dropped by the reindex
+    # above, so fold anything outside the calendar into the next open day.
+    missing = flows.index.difference(calendar)
+    for stamp in missing:
+        later = calendar[calendar >= stamp]
+        if len(later):
+            aligned.loc[later[0]] += flows.loc[stamp]
+
+    # Dollars in -> shares bought at that day's close, and vice versa.
+    shares = (aligned / closes).cumsum()
+    return pd.DataFrame({
+        "shares": shares,
+        "value": shares * closes,
+        "invested": aligned.cumsum(),
+    })
+
+
+def benchmark_comparison(trades: pd.DataFrame, prices: pd.DataFrame,
+                         portfolio: pd.Series,
+                         symbol: str = "SPY") -> Optional[dict]:
+    """
+    Your portfolio against the same cash flows put into the index.
+
+    `portfolio` is the daily value series from portfolio_value(). Both sides
+    are compared on the last date they share, so a benchmark price that has
+    not synced yet can't make the comparison look wrong.
+    """
+    curve = benchmark_curve(trades, prices, symbol)
+    if curve.empty or portfolio.empty:
+        return None
+
+    common = curve.index.intersection(portfolio.index)
+    if len(common) < 2:
+        return None
+
+    last = common[-1]
+    invested = float(curve.loc[last, "invested"])
+    bench_value = float(curve.loc[last, "value"])
+    mine = float(portfolio.loc[last])
+
+    if invested <= 0:
+        return None
+
+    return {
+        "symbol": symbol,
+        "as_of": last,
+        "invested": invested,
+        "portfolio_value": mine,
+        "benchmark_value": bench_value,
+        # The number that matters: dollars ahead of (or behind) doing nothing
+        # clever with the same money on the same days.
+        "difference": mine - bench_value,
+        "portfolio_return": mine / invested - 1.0,
+        "benchmark_return": bench_value / invested - 1.0,
+        "excess_return": (mine - bench_value) / invested,
+        "curve": curve.loc[common, "value"],
+    }
+
+
+# =====================================================================
 # Attribution: discretionary trading vs automated investing
 # =====================================================================
 #

@@ -648,6 +648,75 @@ with tab_performance:
 
             st.divider()
 
+            # --- against the index --------------------------------------
+            # Placed before the return figures because it answers the
+            # blunter question: was any of this worth it?
+            bench = an.benchmark_comparison(trades, prices, curve,
+                                            db.BENCHMARK_SYMBOL)
+            if bench:
+                section(f"Against {bench['symbol']} — same money, same days")
+                b_left, b_right = st.columns([1, 1.6], gap="large")
+                with b_left:
+                    ahead = bench["difference"] >= 0
+                    statement("Counterfactual", [
+                        ("Your portfolio", money(bench["portfolio_value"]),
+                         f"{bench['portfolio_return']:+.2%}", False),
+                        (f"Same $ into {bench['symbol']}",
+                         money(bench["benchmark_value"]),
+                         f"{bench['benchmark_return']:+.2%}", False),
+                        ("Ahead by" if ahead else "Behind by",
+                         tinted(bench["difference"]),
+                         f"{bench['excess_return']:+.2%}", True),
+                    ])
+                    note("Every dollar you put into a position, on the day you "
+                         "put it in, buying the index instead. That is the fair "
+                         "comparison for irregular contributions — measuring "
+                         f"against {bench['symbol']}'s headline return would "
+                         "assume all your money was invested from day one.")
+
+                with b_right:
+                    section("Both curves, same cash flows")
+                    both = pd.DataFrame({
+                        "Your portfolio": curve.reindex(bench["curve"].index),
+                        f"Same $ into {bench['symbol']}": bench["curve"],
+                    }).reset_index().rename(columns={"index": "date"})
+                    both["date"] = pd.to_datetime(both["date"])
+                    melted_b = both.melt("date", var_name="series",
+                                         value_name="amount")
+                    bench_chart = (
+                        alt.Chart(melted_b)
+                        .mark_line(strokeWidth=1.6)
+                        .encode(
+                            x=alt.X("date:T", title=None,
+                                    axis=alt.Axis(grid=False, domain=False,
+                                                  labelColor="#6B6B66")),
+                            y=alt.Y("amount:Q", title=None,
+                                    axis=alt.Axis(format="$,.0f", grid=True,
+                                                  gridColor="#EDEDE8",
+                                                  domain=False,
+                                                  labelColor="#6B6B66")),
+                            color=alt.Color(
+                                "series:N", title=None,
+                                scale=alt.Scale(
+                                    domain=["Your portfolio",
+                                            f"Same $ into {bench['symbol']}"],
+                                    range=[ACCENT, "#C08A3E"]),
+                                legend=alt.Legend(orient="top-left",
+                                                  labelColor="#1A1A18")),
+                            tooltip=[alt.Tooltip("date:T", title="Date"),
+                                     alt.Tooltip("series:N", title=""),
+                                     alt.Tooltip("amount:Q", title="Value",
+                                                 format="$,.2f")],
+                        )
+                        .properties(height=280)
+                        .configure_view(stroke=None)
+                    )
+                    st.altair_chart(bench_chart, width="stretch")
+                    note("Dividends are excluded on both sides, so neither is "
+                         "given an edge the other doesn't get.")
+
+                st.divider()
+
             # --- the two returns, and why they differ --------------------
             col_twr, col_mwr, col_dd = st.columns(3, gap="large")
 

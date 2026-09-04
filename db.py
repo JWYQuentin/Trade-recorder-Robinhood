@@ -182,6 +182,15 @@ CREATE TABLE IF NOT EXISTS opening_balances (
 # will serve; analytics should not imply a record that starts earlier.
 HISTORY_STARTS = "2025-09-22"
 
+# What "the market" means for the benchmark comparison. SPY rather than VOO or
+# QQQ because it is the most widely understood proxy for US large-cap, and the
+# question being answered is "would I have done better doing nothing clever?".
+#
+# It is stored in daily_prices like any other symbol — it needs no separate
+# table, and keeping it there means the same price-coverage checks apply. It is
+# excluded from holdings replay by never appearing in `trades`.
+BENCHMARK_SYMBOL = "SPY"
+
 OPENING_BALANCE_ROWS = [
     ("SPCX", 1.0, HISTORY_STARTS, None,
      "Sold 2026-06-12 with no recorded buy; position opened before history."),

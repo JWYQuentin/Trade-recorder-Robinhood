@@ -415,3 +415,110 @@ def test_benchmark_comparison_none_without_prices():
     prices = make_prices([("2025-01-02", "AAA", 100.0)])   # no SPY
     portfolio = pd.Series({"2025-01-02": 1000.0})
     assert an.benchmark_comparison(trades, prices, portfolio, "SPY") is None
+
+
+# ---------------------------------------------------------------- Stock tab
+
+def test_window_start_counts_calendar_months_back():
+    assert an.window_start("2026-10-21", "1M") == "2026-09-21"
+    assert an.window_start("2026-10-21", "3M") == "2026-07-21"
+    assert an.window_start("2026-10-21", "6M") == "2026-04-21"
+    assert an.window_start("2026-10-21", "1Y") == "2025-10-21"
+
+
+def test_window_start_clamps_to_a_shorter_month():
+    """One month back from 31 March is 28 February, not 3 March."""
+    assert an.window_start("2026-03-31", "1M") == "2026-02-28"
+
+
+def test_window_start_ytd_and_all():
+    assert an.window_start("2026-10-21", "YTD") == "2026-01-01"
+    assert an.window_start("2026-10-21", "All") is None
+
+
+def test_window_start_rejects_an_unknown_range():
+    with pytest.raises(ValueError):
+        an.window_start("2026-10-21", "2W")
+
+
+def test_symbol_closes_filters_symbol_and_start():
+    prices = make_prices([
+        ("2026-01-02", "AAA", 10.0), ("2026-01-02", "BBB", 99.0),
+        ("2026-01-05", "AAA", 11.0), ("2026-01-06", "AAA", 12.0),
+    ])
+    closes = an.symbol_closes(prices, "AAA", start="2026-01-05")
+    assert list(closes.index) == ["2026-01-05", "2026-01-06"]
+    assert list(closes) == [11.0, 12.0]
+
+
+def make_realized(rows):
+    """rows: (timestamp, symbol, realized_gain)"""
+    return pd.DataFrame([{"timestamp": t, "symbol": s, "realized_gain": g}
+                         for t, s, g in rows])
+
+
+def test_symbol_fills_matches_realized_by_time_not_by_day():
+    """
+    Two sells on one day. Robinhood booked the loss on the HIGHER-priced
+    sale (lot selection), so neither a day-level join nor price order would
+    get this right — only the fill time does. A shape seen in real data.
+    """
+    trades = make_trades([
+        ("2026-03-02T15:01:02.71Z", "AAA", "sell", 1.0, 105.0, 0.0),
+        ("2026-03-02T15:30:20.34Z", "AAA", "sell", 1.0, 100.0, 0.0),
+    ])
+    realized = make_realized([
+        ("2026-03-02T15:01:02Z", "AAA", -6.0),
+        ("2026-03-02T15:30:20Z", "AAA", 4.0),
+    ])
+    fills = an.symbol_fills(trades, realized, "AAA").set_index("price")
+    assert fills.loc[105.0, "realized"] == pytest.approx(-6.0)
+    assert fills.loc[100.0, "realized"] == pytest.approx(4.0)
+
+
+def test_symbol_fills_leaves_buys_and_unmatched_sells_blank():
+    """A sell with no realized row is NaN — unknown, not breakeven."""
+    trades = make_trades([
+        ("2026-01-05T15:00:00Z", "AAA", "buy", 2.0, 100.0, 0.0),
+        ("2026-02-05T15:00:00Z", "AAA", "sell", 1.0, 120.0, 0.0),
+    ])
+    realized = make_realized([("2026-03-01T15:00:00Z", "AAA", 20.0)])
+    fills = an.symbol_fills(trades, realized, "AAA")
+    assert fills["realized"].isna().all()
+
+
+def test_symbol_fills_ignores_other_symbols_and_never_duplicates():
+    trades = make_trades([
+        ("2026-01-05T15:00:00Z", "AAA", "buy", 2.0, 100.0, 0.0),
+        ("2026-02-05T15:00:00.5Z", "AAA", "sell", 1.0, 120.0, 0.0),
+        ("2026-02-05T15:00:00Z", "BBB", "sell", 1.0, 50.0, 0.0),
+    ])
+    realized = make_realized([
+        ("2026-02-05T15:00:00Z", "AAA", 20.0),
+        ("2026-02-05T15:00:00Z", "BBB", -5.0),
+    ])
+    fills = an.symbol_fills(trades, realized, "AAA")
+    assert len(fills) == 2
+    assert fills.loc[fills["side"] == "sell", "realized"].item() == 20.0
+
+
+def test_symbol_fills_newest_first_with_amount_and_move_since():
+    """
+    Bought 2 @ $100, sold 1 @ $120, stock now $110: the buy is +10%, the
+    sell -8.33% (the price fell after you sold). Fractional-second and
+    whole-second stamps are ordered by time, not as text.
+    """
+    trades = make_trades([
+        ("2026-01-05T15:00:00.250Z", "AAA", "buy", 2.0, 100.0, 0.0),
+        ("2026-01-05T15:00:01Z", "AAA", "sell", 1.0, 120.0, 0.0),
+    ])
+    fills = an.symbol_fills(trades, pd.DataFrame(), "AAA", latest_close=110.0)
+    assert list(fills["side"]) == ["sell", "buy"]
+    assert list(fills["amount"]) == [120.0, 200.0]
+    assert fills["move_since"].tolist() == pytest.approx([110 / 120 - 1, 0.10])
+    assert list(fills["placed_agent"]) == ["unknown", "unknown"]
+
+
+def test_symbol_fills_empty_for_an_untraded_symbol():
+    trades = make_trades([("2026-01-05T15:00:00Z", "AAA", "buy", 1.0, 1.0, 0.0)])
+    assert an.symbol_fills(trades, pd.DataFrame(), "ZZZ").empty

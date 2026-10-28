@@ -667,3 +667,116 @@ def unrealized_summary(positions: pd.DataFrame) -> dict:
         "return_pct": (value / cost - 1.0) if cost else None,
         "positions": int(len(frame)),
     }
+
+
+# =====================================================================
+# One symbol in detail (the Stock tab)
+# =====================================================================
+#
+# The Stock tab plots one symbol's price with your trades marked on it. The
+# chart itself is presentation, but two pieces of it decide what number a
+# reader sees, so they live here where they can be tested: which dates a
+# range like "3M" covers, and which realized figure belongs to which sell.
+
+RANGES = ("1M", "3M", "6M", "YTD", "1Y", "All")
+
+_RANGE_OFFSETS = {
+    "1M": pd.DateOffset(months=1),
+    "3M": pd.DateOffset(months=3),
+    "6M": pd.DateOffset(months=6),
+    "1Y": pd.DateOffset(years=1),
+}
+
+
+def window_start(last_date: str, key: str) -> Optional[str]:
+    """
+    First date (YYYY-MM-DD, inclusive) of a chart range ending on `last_date`.
+
+    Calendar months rather than a fixed day count, so "1M" back from
+    2026-03-31 is 2026-02-28 — DateOffset clamps to the month's end instead
+    of spilling into March. None for "All": the caller keeps everything,
+    which here means back to the price history floor.
+    """
+    if key == "All":
+        return None
+    end = pd.Timestamp(last_date)
+    if key == "YTD":
+        return f"{end.year}-01-01"
+    if key not in _RANGE_OFFSETS:
+        raise ValueError(f"unknown range {key!r}; expected one of {RANGES}")
+    return (end - _RANGE_OFFSETS[key]).strftime("%Y-%m-%d")
+
+
+def symbol_closes(prices: pd.DataFrame, symbol: str,
+                  start: Optional[str] = None) -> pd.Series:
+    """Daily closes for one symbol, indexed by YYYY-MM-DD, oldest first."""
+    if prices.empty:
+        return pd.Series(dtype=float, name="close")
+    rows = prices[prices["symbol"] == symbol]
+    if start is not None:
+        rows = rows[rows["date"] >= start]
+    closes = rows.set_index("date")["close"].sort_index()
+    closes.index = _date_strings(closes.index)
+    return closes
+
+
+def symbol_fills(trades: pd.DataFrame, realized: pd.DataFrame, symbol: str,
+                 latest_close: Optional[float] = None) -> pd.DataFrame:
+    """
+    Every fill in one symbol, newest first, with Robinhood's own realized
+    gain attached to each sell.
+
+    Matching is on the fill time to the second, not the day. Robinhood stamps
+    each realized row with its sell's fill time (truncated to whole seconds),
+    and one day can carry two sells of the same symbol — a day-level join
+    would hand both sells the same figure. Matching by price instead would be
+    worse: Robinhood picks lots by tax rules, so of two same-day sells the
+    HIGHER-priced one can be the one that booked the loss.
+
+    An unmatched sell gets NaN, never 0: a missing figure must not read as
+    breakeven.
+
+    `move_since` is the change from each fill's price to `latest_close` — a
+    price move, not a return on that trade. A buy can be partly sold since,
+    and a sell's "move since" is what the stock did after you left it.
+    """
+    columns = ["filled_at", "date", "side", "placed_agent", "quantity",
+               "price", "amount", "realized", "move_since"]
+    if trades.empty:
+        return pd.DataFrame(columns=columns)
+
+    fills = trades[trades["symbol"] == symbol].copy()
+    if fills.empty:
+        return pd.DataFrame(columns=columns)
+
+    fills["date"] = _as_date(fills["filled_at"])
+    fills["price"] = fills["average_price"]
+    fills["amount"] = fills["quantity"] * fills["average_price"]
+    fills["placed_agent"] = (fills["placed_agent"].fillna("unknown")
+                             if "placed_agent" in fills else "unknown")
+    # Parsed rather than compared as text: fill times arrive with anywhere
+    # from zero to six fractional digits, which string order gets wrong.
+    fills["ts"] = pd.to_datetime(fills["filled_at"], format="ISO8601",
+                                 utc=True)
+    fills["second"] = fills["ts"].dt.floor("s")
+
+    booked = (realized[realized["symbol"] == symbol]
+              if not realized.empty else realized)
+    if booked.empty:
+        fills["realized"] = np.nan
+    else:
+        # Summed per second before the join so a merge can never duplicate a
+        # fill, even if Robinhood ever split one sale into two rows.
+        per_second = (booked.assign(second=pd.to_datetime(
+                          booked["timestamp"], format="ISO8601",
+                          utc=True).dt.floor("s"))
+                      .groupby("second")["realized_gain"].sum()
+                      .rename("realized"))
+        fills = fills.join(per_second, on="second")
+        fills.loc[fills["side"] != "sell", "realized"] = np.nan
+
+    fills["move_since"] = (latest_close / fills["price"] - 1.0
+                           if latest_close else np.nan)
+
+    return (fills.sort_values("ts", ascending=False)[columns]
+                 .reset_index(drop=True))

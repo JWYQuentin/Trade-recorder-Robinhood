@@ -25,7 +25,7 @@ Excel. It tracks four separate things:
 | `models.py` | `Trade` dataclass + raw-order → `Trade` normalization |
 | `sync_robinhood.py` | Fetches orders, positions and realized P&L (mock or real) |
 | `analytics.py` | Metrics engine — returns, drawdown, attribution. Pure functions, no I/O |
-| `app.py` | Streamlit dashboard — Trades / Holdings / Realized P&L / Performance tabs |
+| `app.py` | Streamlit dashboard — Trades / Holdings / Realized P&L / Performance / Stock tabs |
 | `export_excel.py` | Writes `trading record.xlsx` from the database |
 | `tests/` | pytest suite — metric unit tests plus a live-data reconciliation check |
 | `Open Dashboard.app` | Double-click (or keep in the Dock) to open the dashboard |
@@ -141,7 +141,7 @@ Or double-click **`Open Dashboard.app`** — it can live in your Dock, reuses an
 already-running server instead of starting a second one, and reports problems in
 a readable alert rather than a stack trace.
 
-Four tabs:
+Five tabs:
 
 - **Trades** — every fill, filterable by symbol, side, date range, and *placed
   by*. That last one separates manual trades from automated recurring buys, which
@@ -153,6 +153,11 @@ Four tabs:
   comparison against SPY, time- and money-weighted returns, drawdown, realized
   quality (win rate, profit factor), and a split of discretionary trades against
   automatic ones.
+- **Stock** — one symbol's daily close (1M to all history) with your own trades
+  marked on it: buys you placed, sells coloured by the gain or loss Robinhood
+  booked, recurring buys as ticks, your average cost, and shares held beneath.
+  Opened by clicking a symbol on Holdings or Realized P&L, or by URL
+  (`http://localhost:8501/?symbol=NVDA`). Works for positions you have closed.
 
 Realized and unrealized are kept apart on purpose. One is money already received;
 the other is a market estimate that changes daily. The dashboard never adds them.

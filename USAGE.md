@@ -34,6 +34,7 @@ It appears at **http://localhost:8501**.
 | **Holdings** | What you own now, and the gain you haven't taken. |
 | **Realized P&L** | Gains you *have* taken, per symbol and per closing trade. |
 | **Performance** | How you're actually doing — returns, drawdown, your picks vs autopilot. |
+| **Stock** | One symbol's price over the past year, with your buys and sells marked on it. Click a symbol on Holdings or Realized P&L to open it. |
 
 The sidebar filters apply to the **Trades tab only**.
 

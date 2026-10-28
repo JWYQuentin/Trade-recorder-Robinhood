@@ -184,5 +184,5 @@ These live in this folder and are excluded from git, but don't email or upload t
 
 **Two notes on limits, so nothing surprises you.** Robinhood serves no order
 history before **2025-09-22** — that's the start of your record, not a bug. And
-SPCX and TSLA were partly held before then, so their dollar figures are right but
+a couple of positions were partly held before then, so their dollar figures are right but
 their *percentage* returns aren't; the app flags this rather than hiding it.

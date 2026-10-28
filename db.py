@@ -156,7 +156,7 @@ CREATE TABLE IF NOT EXISTS tax_lots (
 # Shares held on 2025-09-22 that no trade in this database accounts for.
 #
 # Robinhood serves no order history before that date (verified with an
-# unbounded query: 594 filled orders, none earlier) and no tax lot opens
+# unbounded query: hundreds of filled orders, none earlier) and no tax lot opens
 # before it either, so these positions cannot be recovered from any API.
 # Replaying trades alone therefore drives these two symbols negative.
 #
@@ -166,7 +166,7 @@ CREATE TABLE IF NOT EXISTS tax_lots (
 # dollar P&L for these symbols comes from Robinhood's realized_pnl and is
 # correct; percentage returns are not, and the dashboard marks them.
 #
-# Together they are $171 against $52k of equity (0.33%). If Robinhood ever
+# Together they are well under 1% of the account's equity. If Robinhood ever
 # widens its history window, delete this table and the replay stands alone.
 CREATE_OPENING_BALANCES_SQL = """
 CREATE TABLE IF NOT EXISTS opening_balances (
@@ -193,9 +193,9 @@ BENCHMARK_SYMBOL = "SPY"
 
 OPENING_BALANCE_ROWS = [
     ("SPCX", 1.0, HISTORY_STARTS, None,
-     "Sold 2026-06-12 with no recorded buy; position opened before history."),
+     "Sold with no recorded buy; position opened before history."),
     ("TSLA", 0.016904, HISTORY_STARTS, None,
-     "Recurring buys begin 2025-09-29; small holding carried in from before."),
+     "Small holding carried in from before history."),
 ]
 
 

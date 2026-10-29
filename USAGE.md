@@ -31,12 +31,19 @@ It appears at **http://localhost:8501**.
 | Tab | Answers |
 |---|---|
 | **Trades** | Every fill. Filter by symbol, side, date, or who placed it. |
-| **Holdings** | What you own now, and the gain you haven't taken. |
+| **Holdings** | What you own now, the gain you haven't taken, and a 3-month price line per position. |
 | **Realized P&L** | Gains you *have* taken, per symbol and per closing trade. |
 | **Performance** | How you're actually doing — returns, drawdown, your picks vs autopilot. |
 | **Stock** | One symbol's price over the past year, with your buys and sells marked on it. Click a symbol on Holdings or Realized P&L to open it. |
 
-The sidebar filters apply to the **Trades tab only**.
+The Trades filters sit in a row at the top of that tab. They are saved in the page
+address, so a bookmark or a refresh keeps them (`?side=Sells&range=3M`); **Clear
+filters** puts everything back. The Performance tab's **Chart range** zooms its two
+charts only — the figures beside them always cover your whole record.
+
+The top-right corner says when the data was last synced. If that is more than 12
+hours ago it turns red and explains why — almost always the background sync
+needing you to sign in to Robinhood again (see below).
 
 The dashboard never contacts Robinhood — it reads the local database. Holdings are
 priced as of the last sync, so they drift with the market between runs.

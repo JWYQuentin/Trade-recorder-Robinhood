@@ -26,6 +26,7 @@ meaning: green/red on gains and losses, one blue on the active tab and
 the charts. Everything else is ink, muted ink, and paper.
 """
 
+from datetime import date, datetime
 from functools import partial
 
 import altair as alt
@@ -85,6 +86,17 @@ st.markdown("""
   .masthead .asof {
     font-family: var(--mono); font-size: 12px; color: var(--muted);
   }
+  .masthead .asof.stale { color: var(--loss); font-weight: 600; }
+
+  /* Old data gets one ruled line under the masthead, not a coloured box:
+     the red rule and the ⚠︎ say "attention" without a second alert style. */
+  .stale-note {
+    font-size: 13px; line-height: 1.6; color: var(--ink);
+    border-left: 2px solid var(--loss); padding: 2px 0 2px var(--s3);
+    margin: calc(-1 * var(--s2)) 0 var(--s4) 0;
+  }
+  /* Streamlit sets inline code in green, which on this page means "gain". */
+  .stale-note code { font-size: 12px; color: var(--ink); background: #F2F2EF; }
 
   /* ---- the statement block: the signature element ------------------ */
   .stmt { margin: 0 0 var(--s4) 0; }
@@ -138,22 +150,16 @@ st.markdown("""
   /* ---- figures inside Streamlit's own widgets ---------------------- */
   [data-testid="stDataFrame"] { font-variant-numeric: tabular-nums; }
 
-  /* ---- sidebar: a form, kept quiet --------------------------------- */
-  [data-testid="stSidebar"] { border-right: 1px solid var(--rule); }
-  [data-testid="stSidebar"] label {
-    font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em;
-    text-transform: uppercase; color: var(--muted);
-  }
-
   .note { font-size: 12px; color: var(--muted); line-height: 1.6;
           margin-top: var(--s2); }
 
-  /* ---- widget labels in the page body: the sidebar's voice --------- */
+  /* ---- widget labels: set like the section headings, kept quiet ---- */
   [data-testid="stMain"] [data-testid="stWidgetLabel"] p {
     font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em;
     text-transform: uppercase; color: var(--muted);
   }
-  [data-testid="stButtonGroup"] button p {
+  [data-testid="stButtonGroup"] button p,
+  [data-testid="stBaseButton-tertiary"] p {
     font-family: var(--mono); font-size: 12px;
   }
 
@@ -195,6 +201,12 @@ st.markdown("""
     font-size: 12px; color: var(--muted); margin: var(--s1) 0 var(--s2) 0;
   }
   .key b { font-weight: normal; margin-right: 6px; }
+  /* the chart's B/S labels, drawn as they appear on the chart */
+  .key b.badge {
+    display: inline-block; width: 15px; height: 15px; box-sizing: border-box;
+    border: 1.5px solid; border-radius: 50%; text-align: center;
+    font: 600 9px/12px var(--mono); vertical-align: 1px;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -379,21 +391,286 @@ def fill_phrase(fill) -> str:
 
 
 def chart_key(items):
-    """Legend for the Stock chart: (glyph, colour, label) per mark shown."""
-    parts = "".join(f'<span><b style="color:{colour}">{glyph}</b>{label}</span>'
-                    for glyph, colour, label in items)
+    """Legend for the Stock chart: (glyph HTML, label) per mark shown."""
+    parts = "".join(f"<span>{glyph}{label}</span>" for glyph, label in items)
     st.markdown(f'<div class="key">{parts}</div>', unsafe_allow_html=True)
 
 
-def stock_chart(closes, fills, shares, size_max, avg_cost=None, quote=None):
+def key_glyph(text: str, colour: str) -> str:
+    return f'<b style="color:{colour}">{text}</b>'
+
+
+def key_badge(letter: str, look: tuple) -> str:
+    """A key entry drawn like the chart's trade label; `look` from BADGE_LOOK."""
+    fill, ink, line = look
+    return (f'<b class="badge" style="background:{fill};color:{ink};'
+            f'border-color:{line if fill == PAPER else fill}">{letter}</b>')
+
+
+def relative_age(age: pd.Timedelta) -> str:
+    """How long ago, in the unit a person would say it: '5 h ago', '6 days ago'."""
+    minutes = age.total_seconds() / 60
+    if minutes < 2:
+        return "just now"
+    if minutes < 90:
+        return f"{minutes:.0f} min ago"
+    # Hours up to a day and a half, so the smallest day count is "2 days".
+    if minutes < 36 * 60:
+        return f"{minutes / 60:.0f} h ago"
+    return f"{minutes / (24 * 60):.0f} days ago"
+
+
+def line_chart(wide: pd.DataFrame, colours: dict, height: int = 280,
+               step: bool = False) -> None:
+    """
+    Money over time, one line per column of `wide`, with a crosshair.
+
+    wide:    indexed by date (YYYY-MM-DD strings or dates), one column per
+             series. Column order is legend order.
+    colours: series name -> colour, keyed like the columns.
+    step:    hold each value flat until the next one. Right for a running
+             total that only moves on days something happened — a sloped
+             line between two fills would draw money moving that didn't.
+
+    The crosshair is the Stock chart's: it snaps to the nearest day and
+    lists every series for that day in one tooltip, so reading the gap
+    between two lines takes one hover instead of two careful ones. A
+    single series gets no legend; the section title above names it.
+    """
+    names = list(wide.columns)
+    # Positional field names (s0, s1, …) with the real names carried as
+    # titles: "Same $ into SPY" would otherwise have to survive Vega-Lite's
+    # field-name parsing.
+    fields = [f"s{i}" for i in range(len(names))]
+    data = wide.set_axis(fields, axis=1).rename_axis("date").reset_index()
+    data["date"] = pd.to_datetime(data["date"])
+    long = data.melt("date", var_name="field", value_name="amount")
+    long["series"] = long["field"].map(dict(zip(fields, names)))
+
+    x = alt.X("date:T", title=None,
+              axis=alt.Axis(grid=False, domain=False, labelColor=MUTED,
+                            tickCount=6))
+    colour = alt.Color("series:N", title=None,
+                       scale=alt.Scale(domain=names,
+                                       range=[colours[n] for n in names]),
+                       legend=(alt.Legend(orient="top-left", labelColor=INK)
+                               if len(names) > 1 else None))
+    hover = alt.selection_point(name="hover", nearest=True, on="pointerover",
+                                clear="pointerout", fields=["date"],
+                                empty=False)
+
+    lines = (alt.Chart(long)
+             .mark_line(strokeWidth=2,
+                        interpolate="step-after" if step else "linear")
+             .encode(x=x, color=colour,
+                     y=alt.Y("amount:Q", title=None,
+                             scale=alt.Scale(zero=False, padding=10),
+                             axis=alt.Axis(format="$,.0f", grid=True,
+                                           gridColor="#EDEDE8", domain=False,
+                                           labelColor=MUTED, tickCount=5))))
+    # Below the crosshair's hit layer, as on the Stock chart, so a dot can
+    # never steal the pointer from the rule that owns the tooltip.
+    dots = (alt.Chart(long).mark_point(filled=True, size=36, opacity=1)
+            .encode(x=x, y="amount:Q", color=colour)
+            .transform_filter(hover))
+    rule = (alt.Chart(data).mark_rule(color=MUTED, strokeWidth=1)
+            .encode(x=x,
+                    opacity=alt.condition(hover, alt.value(0.7), alt.value(0)),
+                    tooltip=[alt.Tooltip("date:T", title="Date",
+                                         format="%a %b %-d, %Y")]
+                    + [alt.Tooltip(f"{f}:Q", title=n, format="$,.2f")
+                       for f, n in zip(fields, names)])
+            .add_params(hover))
+    st.altair_chart(alt.layer(lines, dots, rule).properties(height=height)
+                    .configure_view(stroke=None), width="stretch")
+
+
+# Trade labels on the Stock chart, in pixels: badge radius, the shortest
+# leader, and the clear space kept between two badges.
+BADGE_R, LEADER, BADGE_GAP = 8, 14, 3
+# The price plot's height is fixed, so once its y domain is fixed a pixel
+# converts exactly to dollars. Its WIDTH stretches with the window and can
+# only be estimated, which matters for deciding whether two labels collide.
+# Guessing low merges labels that had room; guessing high lets them touch.
+# The page is capped at 1280px, which puts the plot near 950px on a laptop
+# and never much past 1050.
+PLOT_PX_ESTIMATE = 900
+# (fill, letter, line) per kind of label. A loss is outlined rather than
+# filled because green/red alone fails deuteranopia (ΔE 6.0, the same pair
+# as ranked_bars), so fill-vs-outline carries the sign a second time.
+BADGE_LOOK = {"buy": (ACCENT, PAPER, ACCENT), "gain": (GAIN, PAPER, GAIN),
+              "loss": (PAPER, LOSS, LOSS), "none": (MUTED, PAPER, MUTED)}
+
+
+def outcome(side: str, realized: float) -> str:
+    """Which BADGE_LOOK a fill, or a label's fills taken together, wears."""
+    if side == "buy":
+        return "buy"
+    if pd.notna(realized) and realized > 0:
+        return "gain"
+    if pd.notna(realized) and realized < 0:
+        return "loss"
+    return "none"     # breakeven, or Robinhood had no row for it
+
+
+def y_domain(needs, height):
+    """
+    A y domain keeping each (value, px_above, px_below) in `needs` at least
+    that many pixels clear of the plot's top and bottom edges.
+
+    The room a label needs is fixed in pixels but the domain is in dollars,
+    and widening the domain changes what a pixel is worth, so this iterates
+    to the fixed point. Each pass changes the span by the margins' share of
+    the plot height — well under a third here — so it settles within a few.
+    """
+    lo = min(v for v, _, _ in needs)
+    hi = max(v for v, _, _ in needs)
+    span = (hi - lo) or abs(hi) * 0.02 or 1.0
+    for _ in range(40):
+        hi = max(v + above * span / height for v, above, _ in needs)
+        lo = min(v - below * span / height for v, _, below in needs)
+        span = hi - lo
+    return lo, hi
+
+
+def trade_labels(manual, x0, x1, needs, height, floor_px=0):
+    """
+    Group manual fills into B/S labels that don't overprint each other or
+    another trade's dot, and find the y domain that leaves room for them.
+
+    Every trading day starts as its own label, one per side. Two labels of
+    the SAME side whose badges would touch at the estimated plot width
+    merge, and so does everything between them, so a label always covers
+    one unbroken run of dates. Collisions are tested in both dimensions:
+    buys at $100 and $90 two days apart sit at different heights and keep
+    a badge each.
+
+    A buy and a sell can't merge, so when a label touches one of the other
+    side's, or lands on a dot that isn't its own, the later label's leader
+    grows by one badge instead, up to MAX_STEPS times. Past that it is left
+    to overlap; the tooltips still separate them.
+
+    Each step moves badges and so the domain, which can cause a new
+    collision, so it repeats until nothing touches. Buys hang below their
+    LOWEST fill and sells sit above their HIGHEST, so a label never covers
+    one of its own fills. floor_px is extra room under the buys for the
+    recurring-buy ticks along the bottom edge.
+
+    Returns (labels, fills, lo, hi). `fills` is `manual` oldest first with a
+    `label` column; `labels` has one row per label, with its badge centre and
+    the bracket its leaders run to, in dollars.
+    """
+    MAX_STEPS, step = 3, 2 * BADGE_R + BADGE_GAP
+    fills = manual.sort_values("filled_at").reset_index(drop=True)
+    groups = [list(ix) for _, ix in
+              sorted(fills.groupby(["side", "date"]).indices.items())]
+    extra = [0] * len(groups)      # px added to each label's leader
+    reach = LEADER + 2 * BADGE_R + 2
+
+    def px_x(day):
+        return (pd.Timestamp(day) - x0) / (x1 - x0) * PLOT_PX_ESTIMATE
+
+    def describe(ix):
+        g = fills.iloc[ix]
+        side = g["side"].iloc[0]
+        first, last = (pd.Timestamp(g["date"].min()),
+                       pd.Timestamp(g["date"].max()))
+        return dict(side=side, n=len(g), first=first, last=last,
+                    mid=first + (last - first) / 2,
+                    end=(g["price"].min() if side == "buy"
+                         else g["price"].max()))
+
+    def box(lab, more, lo, hi):
+        down = 1 if lab["side"] == "buy" else -1
+        cx = px_x(lab["mid"])
+        cy = (height * (hi - lab["end"]) / (hi - lo)
+              + down * (LEADER + more + BADGE_R))
+        # Menlo at 11px is ~6.6px a character; the count sits right of it.
+        count = len(f"×{lab['n']}") * 6.6 + 3 if lab["n"] > 1 else 0
+        return cx - BADGE_R, cx + BADGE_R + count, cy - BADGE_R, cy + BADGE_R
+
+    def touch(a, b):
+        return (a[0] < b[1] + BADGE_GAP and b[0] < a[1] + BADGE_GAP
+                and a[2] < b[3] + BADGE_GAP and b[2] < a[3] + BADGE_GAP)
+
+    dot_x = fills["date"].map(px_x).to_numpy()
+    while True:
+        labels = [describe(ix) for ix in groups]
+        lo, hi = y_domain(
+            needs + [(lab["end"], 0, reach + more + floor_px)
+                     if lab["side"] == "buy" else (lab["end"], reach + more, 0)
+                     for lab, more in zip(labels, extra)], height)
+        boxes = [box(lab, more, lo, hi) for lab, more in zip(labels, extra)]
+        # Groups are sorted by side, then date, so i..j is one side's run.
+        hit = next(((i, j) for i in range(len(groups))
+                    for j in range(i + 1, len(groups))
+                    if labels[i]["side"] == labels[j]["side"]
+                    and touch(boxes[i], boxes[j])), None)
+        if hit is not None:
+            i, j = hit
+            groups[i:j + 1] = [sum(groups[i:j + 1], [])]
+            extra[i:j + 1] = [0]
+            continue
+
+        dots = [(x - 3, x + 3, y - 3, y + 3) for x, y in
+                zip(dot_x, height * (hi - fills["price"].to_numpy()) / (hi - lo))]
+        order = sorted(range(len(groups)), key=lambda k: labels[k]["mid"])
+        rank = {k: r for r, k in enumerate(order)}
+        crowded = next(
+            (k for k in order if extra[k] < MAX_STEPS * step and (
+                any(touch(boxes[k], boxes[j]) for j in range(len(groups))
+                    if labels[j]["side"] != labels[k]["side"]
+                    and rank[j] < rank[k])
+                or any(touch(boxes[k], dots[f]) for f in range(len(fills))
+                       if f not in groups[k]))), None)
+        if crowded is None:
+            break
+        extra[crowded] += step
+
+    per_px = (hi - lo) / height
+    for n, (lab, ix, more) in enumerate(zip(labels, groups, extra)):
+        down = -1 if lab["side"] == "buy" else 1
+        g = fills.iloc[ix]
+        net = g["realized"].sum(min_count=1)
+        lab.update(look=outcome(lab["side"], net),
+                   bracket=lab["end"] + down * (LEADER + more) * per_px,
+                   centre=(lab["end"]
+                           + down * (LEADER + more + BADGE_R) * per_px),
+                   **label_tip(g, lab, net))
+        fills.loc[ix, "label"] = n
+    return pd.DataFrame(labels), fills, lo, hi
+
+
+def label_tip(g, lab, net) -> dict:
+    """Tooltip text for one B/S label: when, what, and how much in total."""
+    if lab["first"] == lab["last"]:
+        when = lab["first"].strftime("%a %b %-d, %Y")
+    elif lab["first"].year == lab["last"].year:
+        when = (f"{lab['first'].strftime('%b %-d')} – "
+                f"{lab['last'].strftime('%b %-d, %Y')}")
+    else:
+        when = (f"{lab['first'].strftime('%b %-d, %Y')} – "
+                f"{lab['last'].strftime('%b %-d, %Y')}")
+    if len(g) == 1:
+        what = fill_phrase(g.iloc[0])
+    else:
+        noun = "buys" if lab["side"] == "buy" else "sells"
+        what = (f"{len(g)} {noun}, {shares_text(g['quantity'].sum())} shares "
+                f"@ {money(g['price'].min())} – {money(g['price'].max())}")
+        if lab["side"] == "sell" and pd.notna(net):
+            what += f" ({'+' if net > 0 else ''}{money(net)} realized, net)"
+    return dict(when=when, what=what, total=money(g["amount"].sum()))
+
+
+def stock_chart(closes, fills, shares, avg_cost=None, quote=None) -> bool:
     """
     One symbol's daily close with your trades marked on it, shares beneath.
+    Returns True when any B/S label covers more than one trade, so the
+    chart key can explain the count.
 
     closes:   daily closes for the window shown (YYYY-MM-DD index).
     fills:    symbol_fills() rows inside that window.
     shares:   shares held per day, same index as `closes`.
-    size_max: largest manual fill in dollars across ALL time, so a marker's
-              size means the same thing whichever range is showing.
     avg_cost: Robinhood's average cost, drawn as a dashed reference line.
     quote:    (date, price) of the snapshot quote, drawn as a hollow end
               point so the chart ends where the header price says it does.
@@ -401,10 +678,16 @@ def stock_chart(closes, fills, shares, size_max, avg_cost=None, quote=None):
     Encoding, and why:
       - The price line is ink, not the accent. Here the line is context;
         the trades are the story, so they get the colour.
-      - Buys you placed are blue ▲, sized by dollars.
-      - Sells are ▼, green and FILLED for a gain Robinhood booked, red and
-        OUTLINED for a loss. Green/red alone fails deuteranopia (ΔE 6.0,
-        same pair as ranked_bars), so fill-vs-outline carries the sign too.
+      - Each trade you placed is a dot at its exact fill price, with a
+        dashed leader to a lettered badge: B below for a buy, S above for
+        a sell. The dot pins the position; the letter names it without
+        a legend. Sell badges are green for a gain Robinhood booked, red
+        and outlined for a loss — BADGE_LOOK says why both.
+      - Trades too close to label one by one share a badge with a count
+        (trade_labels): a leader still runs from every dot to a bracket
+        over the badge, so no fill loses its position. Triangles sized by
+        dollars were tried first and piled into one smear wherever you
+        traded on consecutive days.
       - Recurring buys are ticks along the bottom edge. A daily schedule
         adds ~250 a year; drawn as triangles they would bury the price line.
       - Shares held is its own strip below, not a second y-axis on the
@@ -448,8 +731,28 @@ def stock_chart(closes, fills, shares, size_max, avg_cost=None, quote=None):
                           "shares": held_shares,
                           "trades": closes.index.map(per_day).fillna("—")})
 
-    y = alt.Y("close:Q", title=None,
-              scale=alt.Scale(zero=False, padding=14),
+    # The y domain is set here rather than left to Vega, because the trade
+    # labels are placed in pixels and need to know what a pixel is worth.
+    # 14px around the price line is the padding Vega used to add.
+    manual = fills[fills["placed_agent"] != "recurring"]
+    recurring = fills[fills["placed_agent"] == "recurring"]
+    needs = [(closes.min(), 14, 14), (closes.max(), 14, 14)]
+    if avg_cost:
+        needs.append((avg_cost, 18, 4))      # its label sits above the line
+    if quote:
+        needs.append((quote[1], 6, 6))
+    if manual.empty:
+        lo, hi = y_domain(needs, price_h)
+    else:
+        labels, placed, lo, hi = trade_labels(
+            manual, days[0], pd.Timestamp(last), needs, price_h,
+            floor_px=10 if not recurring.empty else 0)
+    y_scale = alt.Scale(domain=[lo, hi], nice=False, zero=False)
+
+    def y_of(field):
+        return alt.Y(field, title=None, scale=y_scale)
+
+    y = alt.Y("close:Q", title=None, scale=y_scale,
               axis=alt.Axis(format="$,.0f", grid=True, gridColor="#EDEDE8",
                             tickCount=5, **y_axis))
     x_hidden = alt.X("date:T", title=None, axis=None, scale=x_scale)
@@ -465,14 +768,13 @@ def stock_chart(closes, fills, shares, size_max, avg_cost=None, quote=None):
                             "label": [f"avg cost {money(avg_cost)}"]})
         layers += [
             alt.Chart(ref).mark_rule(color=MUTED, strokeDash=[4, 3],
-                                     strokeWidth=1).encode(y="close:Q"),
+                                     strokeWidth=1).encode(y=y_of("close:Q")),
             alt.Chart(ref).mark_text(align="right", baseline="bottom", dy=-4,
                                      color=MUTED, font="Menlo, monospace",
                                      fontSize=11)
-            .encode(x=x_hidden, y="close:Q", text="label:N"),
+            .encode(x=x_hidden, y=y_of("close:Q"), text="label:N"),
         ]
 
-    recurring = fills[fills["placed_agent"] == "recurring"]
     if not recurring.empty:
         layers.append(
             alt.Chart(pd.DataFrame({"date": pd.to_datetime(recurring["date"])}))
@@ -482,7 +784,7 @@ def stock_chart(closes, fills, shares, size_max, avg_cost=None, quote=None):
 
     # Below the crosshair's hit layer, so it can never steal the pointer.
     layers.append(base.mark_point(filled=True, color=INK, size=36)
-                  .encode(y="close:Q")
+                  .encode(y=y_of("close:Q"))
                   .transform_filter(hover))
     layers.append(
         base.mark_rule(color=MUTED, strokeWidth=1)
@@ -496,46 +798,77 @@ def stock_chart(closes, fills, shares, size_max, avg_cost=None, quote=None):
                          alt.Tooltip("trades:N", title="Your trades")])
         .add_params(hover))
 
-    # Trade markers sit ABOVE the crosshair layer so their own tooltips win
+    # Trade labels sit ABOVE the crosshair layer so their own tooltips win
     # when the pointer is on one.
-    manual = fills[fills["placed_agent"] != "recurring"]
+    grouped = False
     if not manual.empty:
-        def look(f):
-            if f["side"] == "buy":
-                return ACCENT, PAPER, 1.5
-            if pd.notna(f["realized"]) and f["realized"] > 0:
-                return GAIN, PAPER, 1.5
-            if pd.notna(f["realized"]) and f["realized"] < 0:
-                return PAPER, LOSS, 2.0
-            return MUTED, PAPER, 1.5    # breakeven, or Robinhood had no row
-        fill_c, stroke_c, width = zip(*manual.apply(look, axis=1))
-        marks = pd.DataFrame({
-            "date": pd.to_datetime(manual["date"]),
-            "price": manual["price"].to_numpy(),
-            "amount": manual["amount"].to_numpy(),
-            "what": manual.apply(fill_phrase, axis=1).to_numpy(),
-            "shape": manual["side"].map({"buy": "triangle-up",
-                                         "sell": "triangle-down"}).to_numpy(),
-            "fill": fill_c, "stroke": stroke_c, "width": width,
-        })
+        look = labels["look"].map(BADGE_LOOK)
+        labels = labels.assign(
+            fill=look.str[0], ink=look.str[1], line=look.str[2],
+            # A filled badge gets a ring of paper so a leader or the price
+            # line passing behind it stops cleanly at its edge.
+            ring=[PAPER if f != PAPER else l
+                  for f, l in zip(look.str[0], look.str[2])],
+            letter=labels["side"].map({"buy": "B", "sell": "S"}),
+            count=[f"×{n}" if n > 1 else "" for n in labels["n"]])
+        dot = placed.apply(lambda f: BADGE_LOOK[outcome(f["side"],
+                                                        f["realized"])],
+                           axis=1)
+        label = placed["label"].astype(int)
+        placed = placed.assign(
+            date=pd.to_datetime(placed["date"]),
+            bracket=label.map(labels["bracket"]),
+            line=label.map(labels["line"]),
+            fill=dot.str[0],
+            ring=[PAPER if f != PAPER else l
+                  for f, l in zip(dot.str[0], dot.str[2])],
+            what=placed.apply(fill_phrase, axis=1))
+
+        at_fill = alt.Chart(placed).encode(x=x_hidden, y=y_of("price:Q"))
         layers.append(
-            alt.Chart(marks).mark_point(opacity=1, cursor="default")
-            .encode(
-                x=x_hidden,
-                y=alt.Y("price:Q", title=None),
-                shape=alt.Shape("shape:N", scale=None),
-                fill=alt.Fill("fill:N", scale=None),
-                stroke=alt.Stroke("stroke:N", scale=None),
-                strokeWidth=alt.StrokeWidth("width:Q", scale=None),
-                size=alt.Size("amount:Q", legend=None,
-                              scale=alt.Scale(type="sqrt",
-                                              domain=[0, size_max or 1],
-                                              range=[40, 420])),
-                tooltip=[alt.Tooltip("date:T", title="Date",
-                                     format="%a %b %-d, %Y"),
-                         alt.Tooltip("what:N", title="Trade"),
-                         alt.Tooltip("amount:Q", title="Amount",
-                                     format="$,.2f")]))
+            at_fill.mark_rule(strokeDash=[2, 2], strokeWidth=1, opacity=0.8)
+            .encode(y2="bracket:Q", color=alt.Color("line:N", scale=None)))
+        spans = labels[labels["first"] < labels["last"]]
+        if not spans.empty:
+            layers.append(
+                alt.Chart(spans).mark_rule(strokeWidth=1, opacity=0.8)
+                .encode(x=alt.X("first:T", title=None, axis=None,
+                                scale=x_scale),
+                        x2="last:T", y=y_of("bracket:Q"),
+                        color=alt.Color("line:N", scale=None)))
+        layers.append(
+            at_fill.mark_point(shape="circle", filled=True, size=30,
+                               opacity=1, strokeWidth=1.5, cursor="default")
+            .encode(fill=alt.Fill("fill:N", scale=None),
+                    stroke=alt.Stroke("ring:N", scale=None),
+                    tooltip=[alt.Tooltip("date:T", title="Date",
+                                         format="%a %b %-d, %Y"),
+                             alt.Tooltip("what:N", title="Trade"),
+                             alt.Tooltip("amount:Q", title="Amount",
+                                         format="$,.2f")]))
+
+        badge = alt.Chart(labels).encode(
+            x=alt.X("mid:T", title=None, axis=None, scale=x_scale),
+            y=y_of("centre:Q"),
+            tooltip=[alt.Tooltip("when:N", title="When"),
+                     alt.Tooltip("what:N", title="Trades"),
+                     alt.Tooltip("total:N", title="Amount")])
+        layers += [
+            badge.mark_point(shape="circle", filled=True, opacity=1,
+                             size=(2 * BADGE_R) ** 2, strokeWidth=1.5,
+                             cursor="default")
+            .encode(fill=alt.Fill("fill:N", scale=None),
+                    stroke=alt.Stroke("ring:N", scale=None)),
+            badge.mark_text(font="Menlo, monospace", fontSize=10,
+                            fontWeight="bold", align="center",
+                            baseline="middle", cursor="default")
+            .encode(text="letter:N", color=alt.Color("ink:N", scale=None)),
+            badge.mark_text(font="Menlo, monospace", fontSize=11,
+                            color=MUTED, align="left", baseline="middle",
+                            dx=BADGE_R + 3)
+            .encode(text="count:N"),
+        ]
+        grouped = bool((labels["n"] > 1).any())
 
     if quote:
         layers.append(
@@ -543,7 +876,7 @@ def stock_chart(closes, fills, shares, size_max, avg_cost=None, quote=None):
                                     "close": [quote[1]]}))
             .mark_point(shape="circle", size=56, filled=True, fill=PAPER,
                         stroke=INK, strokeWidth=1.5)
-            .encode(x=x_hidden, y="close:Q",
+            .encode(x=x_hidden, y=y_of("close:Q"),
                     tooltip=[alt.Tooltip("close:Q", title="Quote at snapshot",
                                          format="$,.2f")]))
 
@@ -575,6 +908,7 @@ def stock_chart(closes, fills, shares, size_max, avg_cost=None, quote=None):
         .configure_view(stroke=None)
     )
     st.altair_chart(strip, width="stretch")
+    return grouped
 
 
 # =====================================================================
@@ -661,13 +995,46 @@ h_all = holdings_table(positions) if not positions.empty else pd.DataFrame()
 # Masthead
 # =====================================================================
 
-as_of = (positions["as_of"].iloc[0][:16].replace("T", " ")
-         if not positions.empty else "not synced")
+# How old the data is, said loudly once it's old enough to matter. The
+# scheduled sync runs every 6 hours, so 12 means at least one run in a row
+# has gone missing. It needs saying because nothing else on the page
+# changes when the sync stops: every figure still renders, just frozen.
+# The usual cause is Robinhood asking to sign in again, which an unattended
+# run can't do, and that went unnoticed for six days once.
+STALE_AFTER = pd.Timedelta(hours=12)
+
+# Both stamps are written by the same successful sync. Positions are kept
+# when Robinhood returns nothing (see db.replace_positions), so their as_of
+# only moves forward when a sync actually learned something.
+stamps = ([positions["as_of"].max()] if not positions.empty else []) + (
+    [account["snapshot_at"].max()] if not account.empty else [])
+if stamps:
+    synced = max(pd.Timestamp(s) for s in stamps)
+    # The app only ever runs on this Mac, so the server's zone is the reader's.
+    local = synced.tz_convert(datetime.now().astimezone().tzinfo)
+    age = pd.Timestamp.now(tz="UTC") - synced
+    stale = age > STALE_AFTER
+    as_of = (f"synced {relative_age(age)} · "
+             f"{local.strftime('%a %b %-d, %-I:%M %p')}")
+else:
+    stale, as_of = False, "not synced yet"
+
 st.markdown(
     f'<div class="masthead"><h1>Trade Recorder</h1>'
-    f'<span class="asof">Robinhood · snapshot {as_of} UTC</span></div>',
+    f'<span class="asof{" stale" if stale else ""}">Robinhood · {as_of}'
+    f'</span></div>',
     unsafe_allow_html=True,
 )
+if stale:
+    st.markdown(
+        f'<div class="stale-note">⚠︎ <b>Every figure below is '
+        f'{relative_age(age).removesuffix(" ago")} old.</b> The scheduled sync '
+        f'runs every 6 hours, so something has stopped it: usually Robinhood '
+        f'wanting you to sign in again, which it can\'t do unattended; '
+        f'sometimes just a Mac that has been asleep. Run '
+        f'<code>python sync_robinhood.py</code> in Terminal once, then '
+        f'refresh this page.</div>',
+        unsafe_allow_html=True)
 
 tab_trades, tab_holdings, tab_realized, tab_performance, tab_stock = st.tabs(
     ["Trades", "Holdings", "Realized P&L", "Performance", "Stock"],
@@ -687,50 +1054,89 @@ with tab_trades:
     if trades.empty:
         st.info(f"No trades synced yet. {SYNC_HINT}")
     else:
-        st.sidebar.markdown(
-            '<div class="sec" style="margin-top:0">Filters</div>',
-            unsafe_allow_html=True)
-        st.sidebar.caption("Applies to the Trades tab only.")
-
-        # Each filter defaults to EMPTY meaning "everything". Defaulting to
-        # every value selected filled the sidebar with 20 symbol chips and
-        # buried the controls beneath them.
-        def pick(label, options, help=None):
-            chosen = st.sidebar.multiselect(
-                label, options, default=[], placeholder="All", help=help)
-            return chosen or list(options)
-
-        symbols = sorted(trades["symbol"].unique())
-        sel_symbols = pick("Symbol", symbols)
-        sel_sides = pick("Side", sorted(trades["side"].unique()))
+        # The filters sit in one row above what they filter. In the sidebar
+        # they were a second place to look, they stayed on screen over tabs
+        # they didn't apply to, and they took 250px from every chart.
+        #
+        # Every one defaults to "everything" — an empty symbol list, "All"
+        # on the rest — so an untouched page is the whole record, with no
+        # row of 20 pre-selected chips. Each is bound to the URL under its
+        # key (?side=Sells&by=You&range=3M), and Streamlit drops a parameter
+        # again once its widget is back at the default, so a bookmark or a
+        # refresh keeps a filtered view and a plain URL stays plain.
+        sides = {"All": None, "Buys": "buy", "Sells": "sell"}
         # placed_agent separates trades you chose from automatic recurring
         # buys — most of the row count here is dollar-cost averaging.
-        agents = sorted(trades["placed_agent"].fillna("unknown").unique())
-        sel_agents = pick("Placed by", agents,
-                          help="'user' is a trade you placed; 'recurring' is "
-                               "an automatic investment.")
+        agent_names = {"user": "You", "recurring": "Recurring",
+                       "unknown": "Unknown"}
+        agents = trades["placed_agent"].fillna("unknown")
+        order = list(agent_names)
+        by = {"All": None} | {
+            agent_names.get(a, a): a
+            for a in sorted(agents.unique(),
+                            key=lambda a: (order.index(a) if a in order
+                                           else len(order), a))}
+        ranges = list(an.RANGES) + ["Custom"]
 
         fill_dates = pd.to_datetime(
             trades["filled_at"], format="ISO8601", utc=True).dt.date
         earliest, latest = fill_dates.min(), fill_dates.max()
-        picked = st.sidebar.date_input(
-            "Filled between", value=(earliest, latest),
-            min_value=earliest, max_value=latest)
-        # Streamlit returns a 1-tuple midway through picking a range; hold
-        # the full range until both ends exist or the table blanks out.
-        start_date, end_date = picked if (
-            isinstance(picked, tuple) and len(picked) == 2
-        ) else (earliest, latest)
 
-        st.sidebar.divider()
-        st.sidebar.caption("New data: `python sync_robinhood.py`")
+        def clear_filters():
+            for k, v in {"symbols": [], "side": "All", "by": "All",
+                         "range": "All"}.items():
+                st.session_state[k] = v
+            st.session_state.pop("dates", None)
+
+        # Widths are the controls' own: narrower than ~190px and "Sells"
+        # wraps onto a second line under "All | Buys".
+        c_sym, c_side, c_by, c_range = st.columns([1.1, 1.0, 1.25, 2.1],
+                                                  vertical_alignment="bottom")
+        with c_sym:
+            sel_symbols = st.multiselect(
+                "Symbol", sorted(trades["symbol"].unique()),
+                placeholder="All", key="symbols", bind="query-params")
+        with c_side:
+            side = st.segmented_control("Side", list(sides), default="All",
+                                        required=True, key="side",
+                                        bind="query-params")
+        with c_by:
+            agent = st.segmented_control(
+                "Placed by", list(by), default="All", required=True,
+                key="by", bind="query-params",
+                help="“You” is a trade you placed; “Recurring” is an "
+                     "automatic investment.")
+        with c_range:
+            window = st.segmented_control("Filled", ranges, default="All",
+                                          required=True, key="range",
+                                          bind="query-params")
+
+        if window == "Custom":
+            picked = st.date_input(
+                "Filled between", value=(earliest, latest),
+                min_value=earliest, max_value=latest, key="dates",
+                bind="query-params", width=280)
+            # Streamlit returns a 1-tuple midway through picking a range;
+            # hold the full range until both ends exist or the table blanks.
+            start_date, end_date = picked if (
+                isinstance(picked, tuple) and len(picked) == 2
+            ) else (earliest, latest)
+        else:
+            # Back from today, not from the newest fill: "last month" means
+            # the calendar's last month even if you haven't traded lately.
+            start = an.window_start(date.today().isoformat(), window)
+            start_date = date.fromisoformat(start) if start else earliest
+            end_date = latest
 
         filtered = trades[
-            trades["symbol"].isin(sel_symbols)
-            & trades["side"].isin(sel_sides)
-            & trades["placed_agent"].fillna("unknown").isin(sel_agents)
+            (trades["symbol"].isin(sel_symbols) if sel_symbols else True)
+            & ((trades["side"] == sides[side]) if sides[side] else True)
+            & ((agents == by[agent]) if by[agent] else True)
             & fill_dates.between(start_date, end_date)
         ]
+        if sel_symbols or side != "All" or agent != "All" or window != "All":
+            st.button("Clear filters", type="tertiary", icon=":material/close:",
+                      on_click=clear_filters)
 
         gross = filtered["quantity"] * filtered["average_price"]
         buys = filtered["side"] == "buy"
@@ -762,8 +1168,8 @@ with tab_trades:
                 note("No trades match the current filters.")
             else:
                 curve["Net invested"] = curve["flow"].cumsum()
-                st.area_chart(curve.set_index("date")[["Net invested"]],
-                              color="#1C5CAB", height=260)
+                line_chart(curve.set_index("date")[["Net invested"]],
+                           {"Net invested": ACCENT}, height=260, step=True)
 
         section(f"Fills · {len(filtered):,} of {len(trades):,}")
         # status and asset_type are constant, created_at duplicates
@@ -826,11 +1232,34 @@ with tab_holdings:
                         pick_key=clickable("holdings-bars"))
 
         section("Positions")
+        # Three months of closes per row: enough to say "has been falling"
+        # or "just spiked" before anyone opens the Stock tab, short enough
+        # to stay a glance. Drawn in ink, not green/red, because it is the
+        # stock's move; the tinted columns beside it are your gain.
+        if not prices.empty:
+            since = an.window_start(prices["date"].max(), "3M")
+            trend = {s: an.symbol_closes(prices, s, since).tolist()
+                     for s in h["symbol"]}
+        else:
+            trend = {}
+        # Percentages in points for a printf format, as in the Stock tab's
+        # trade log: "percent" trims zeros, so 17.60% printed as "17.6%".
+        table = h.assign(trend=h["symbol"].map(lambda s: trend.get(s, [])),
+                         unrealized_pct=h["unrealized_pct"] * 100,
+                         weight=h["weight"] * 100)[
+            ["symbol", "quantity", "average_buy_price", "last_price", "trend",
+             "cost_basis", "market_value", "unrealized", "unrealized_pct",
+             "weight"]]
+
+        def sign_colour(v):
+            if pd.isna(v) or v == 0:
+                return ""
+            return f"color: {GAIN if v > 0 else LOSS}"
+
         positions_key = clickable("holdings-table")
         st.dataframe(
-            h[["symbol", "quantity", "average_buy_price", "last_price",
-               "cost_basis", "market_value", "unrealized", "unrealized_pct",
-               "weight"]],
+            table.style.map(sign_colour,
+                            subset=["unrealized", "unrealized_pct"]),
             width="stretch", hide_index=True,
             key=positions_key, selection_mode=ROW_OR_CELL,
             on_select=partial(_open_from_rows, positions_key,
@@ -843,6 +1272,10 @@ with tab_holdings:
                     "Avg cost", format="dollar"),
                 "last_price": st.column_config.NumberColumn(
                     "Last", format="dollar"),
+                "trend": st.column_config.LineChartColumn(
+                    "3 months", width="small", color=INK,
+                    help="Daily closes over the last three months — the "
+                         "stock's price, not your return."),
                 "cost_basis": st.column_config.NumberColumn(
                     "Cost", format="dollar"),
                 "market_value": st.column_config.NumberColumn(
@@ -850,9 +1283,9 @@ with tab_holdings:
                 "unrealized": st.column_config.NumberColumn(
                     "Unrealized", format="accounting"),
                 "unrealized_pct": st.column_config.NumberColumn(
-                    "Return", format="percent"),
+                    "Return", format="%+.2f%%"),
                 "weight": st.column_config.NumberColumn(
-                    "Weight", format="percent"),
+                    "Weight", format="%.2f%%"),
             },
         )
         note("Select a row — or click a bar above — to open that stock's "
@@ -973,6 +1406,25 @@ with tab_performance:
             deployed = float(flows.sum())
             ending = float(curve.iloc[-1])
 
+            # The range zooms the two charts and nothing else. Every figure
+            # here is a whole-record measure — a 1M "TWR" would be a
+            # different statistic wearing the same label — so the note says
+            # so beside the control rather than leaving it to be guessed.
+            c_zoom, c_zoom_note = st.columns([1.3, 2], gap="large",
+                                             vertical_alignment="center")
+            with c_zoom:
+                zoom = st.segmented_control("Chart range", an.RANGES,
+                                            default="All", required=True,
+                                            key="perf_range")
+            with c_zoom_note:
+                note(f"Zooms the two charts only. Every figure on this tab "
+                     f"covers the whole record, {first_day} to {last_day}.")
+            zoom_start = an.window_start(last_day, zoom)
+            zoom_label = "" if zoom == "All" else f" · {zoom}"
+
+            def zoomed(frame):
+                return frame[frame.index >= zoom_start] if zoom_start else frame
+
             # --- headline: value against the capital that built it --------
             left, right = st.columns([1, 1.6], gap="large")
             with left:
@@ -989,46 +1441,19 @@ with tab_performance:
                      "history. Cash sitting uninvested is invisible here.")
 
             with right:
-                section("Portfolio value against capital deployed")
+                section(f"Portfolio value against capital deployed{zoom_label}")
                 # The GAP between these two lines is unrealized gain, read
                 # visually. Plotting them together beats a derived third
                 # line because it also shows the capital ramp that explains
                 # why the annualised figures below run hot.
+                # Cumulated over the whole record BEFORE zooming, so a zoomed
+                # capital line sits at its true level instead of restarting
+                # from zero at the window's edge.
                 basis = flows.reindex(curve.index, fill_value=0.0).cumsum()
-                chart_data = pd.DataFrame({
+                line_chart(zoomed(pd.DataFrame({
                     "Portfolio value": curve,
                     "Capital deployed": basis,
-                }).reset_index().rename(columns={"index": "date"})
-                chart_data["date"] = pd.to_datetime(chart_data["date"])
-                melted = chart_data.melt("date", var_name="series",
-                                         value_name="amount")
-                line = (
-                    alt.Chart(melted)
-                    .mark_line(strokeWidth=1.6)
-                    .encode(
-                        x=alt.X("date:T", title=None,
-                                axis=alt.Axis(grid=False, domain=False,
-                                              labelColor="#6B6B66")),
-                        y=alt.Y("amount:Q", title=None,
-                                axis=alt.Axis(format="$,.0f", grid=True,
-                                              gridColor="#EDEDE8", domain=False,
-                                              labelColor="#6B6B66")),
-                        color=alt.Color("series:N", title=None,
-                                        scale=alt.Scale(
-                                            domain=["Portfolio value",
-                                                    "Capital deployed"],
-                                            range=[ACCENT, "#A8A8A2"]),
-                                        legend=alt.Legend(orient="top-left",
-                                                          labelColor="#1A1A18")),
-                        tooltip=[alt.Tooltip("date:T", title="Date"),
-                                 alt.Tooltip("series:N", title=""),
-                                 alt.Tooltip("amount:Q", title="Amount",
-                                             format="$,.2f")],
-                    )
-                    .properties(height=280)
-                    .configure_view(stroke=None)
-                )
-                st.altair_chart(line, width="stretch")
+                })), {"Portfolio value": ACCENT, "Capital deployed": "#A8A8A2"})
                 note("The gap between the lines is unrealized gain. Where the "
                      "grey line steps up, capital was added — that is a "
                      "deposit, not performance.")
@@ -1062,43 +1487,12 @@ with tab_performance:
                          "assume all your money was invested from day one.")
 
                 with b_right:
-                    section("Both curves, same cash flows")
-                    both = pd.DataFrame({
+                    section(f"Both curves, same cash flows{zoom_label}")
+                    index_name = f"Same $ into {bench['symbol']}"
+                    line_chart(zoomed(pd.DataFrame({
                         "Your portfolio": curve.reindex(bench["curve"].index),
-                        f"Same $ into {bench['symbol']}": bench["curve"],
-                    }).reset_index().rename(columns={"index": "date"})
-                    both["date"] = pd.to_datetime(both["date"])
-                    melted_b = both.melt("date", var_name="series",
-                                         value_name="amount")
-                    bench_chart = (
-                        alt.Chart(melted_b)
-                        .mark_line(strokeWidth=1.6)
-                        .encode(
-                            x=alt.X("date:T", title=None,
-                                    axis=alt.Axis(grid=False, domain=False,
-                                                  labelColor="#6B6B66")),
-                            y=alt.Y("amount:Q", title=None,
-                                    axis=alt.Axis(format="$,.0f", grid=True,
-                                                  gridColor="#EDEDE8",
-                                                  domain=False,
-                                                  labelColor="#6B6B66")),
-                            color=alt.Color(
-                                "series:N", title=None,
-                                scale=alt.Scale(
-                                    domain=["Your portfolio",
-                                            f"Same $ into {bench['symbol']}"],
-                                    range=[ACCENT, "#C08A3E"]),
-                                legend=alt.Legend(orient="top-left",
-                                                  labelColor="#1A1A18")),
-                            tooltip=[alt.Tooltip("date:T", title="Date"),
-                                     alt.Tooltip("series:N", title=""),
-                                     alt.Tooltip("amount:Q", title="Value",
-                                                 format="$,.2f")],
-                        )
-                        .properties(height=280)
-                        .configure_view(stroke=None)
-                    )
-                    st.altair_chart(bench_chart, width="stretch")
+                        index_name: bench["curve"],
+                    })), {"Your portfolio": ACCENT, index_name: "#C08A3E"})
                     note("Dividends are excluded on both sides, so neither is "
                          "given an edge the other doesn't get.")
 
@@ -1330,8 +1724,6 @@ with tab_stock:
 
             fills = an.symbol_fills(trades, realized, focus,
                                     latest_close=latest)
-            manual_all = fills[fills["placed_agent"] != "recurring"]
-            size_max = float(manual_all["amount"].max()) if len(manual_all) else 0
             has_recurring = (fills["placed_agent"] == "recurring").any()
 
             header = st.container()   # filled below, once the range is known
@@ -1379,36 +1771,43 @@ with tab_stock:
                     unsafe_allow_html=True)
 
             # -- the chart -----------------------------------------------
+            # The key goes above the chart but is finished after it: only
+            # the chart knows whether any label had to group trades.
+            key_slot = st.empty()
             key = []
             manual = shown[shown["placed_agent"] != "recurring"]
             if (manual["side"] == "buy").any():
-                key.append(("▲", ACCENT, "Buy you placed"))
-            sells = manual[manual["side"] == "sell"]
-            if (sells["realized"] > 0).any():
-                key.append(("▼", GAIN, "Sell, gain booked"))
-            if (sells["realized"] < 0).any():
-                key.append(("▽", LOSS, "Sell, loss booked"))
-            if (sells["realized"].isna() | (sells["realized"] == 0)).any():
-                key.append(("▼", MUTED, "Sell, no gain or loss"))
+                key.append((key_badge("B", BADGE_LOOK["buy"]),
+                            "Buy you placed"))
+            sold = set(outcome("sell", r)
+                       for r in manual.loc[manual["side"] == "sell", "realized"])
+            for kind, words in [("gain", "Sell, gain booked"),
+                                ("loss", "Sell, loss booked"),
+                                ("none", "Sell, no gain or loss")]:
+                if kind in sold:
+                    key.append((key_badge("S", BADGE_LOOK[kind]), words))
             if show_recurring and (shown["placed_agent"] == "recurring").any():
-                key.append(("|", ACCENT, "Recurring buy"))
+                key.append((key_glyph("|", ACCENT), "Recurring buy"))
             if pos is not None and pd.notna(pos["average_buy_price"]):
-                key.append(("- -", MUTED, "Your average cost"))
+                key.append((key_glyph("- -", MUTED), "Your average cost"))
             if quote:
-                key.append(("○", INK, "Quote at snapshot"))
-            if len(manual):
-                key.append(("", MUTED, "· markers sized by dollars"))
-            chart_key(key)
+                key.append((key_glyph("○", INK), "Quote at snapshot"))
 
             held_series = an.holdings_over_time(trades, prices, opening)
             shares = (held_series[focus] if focus in held_series
                       else pd.Series(0.0, index=all_closes.index))
-            stock_chart(closes, shown, shares, size_max,
-                        avg_cost=(float(pos["average_buy_price"])
-                                  if pos is not None
-                                  and pd.notna(pos["average_buy_price"])
-                                  else None),
-                        quote=quote)
+            grouped = stock_chart(
+                closes, shown, shares,
+                avg_cost=(float(pos["average_buy_price"])
+                          if pos is not None
+                          and pd.notna(pos["average_buy_price"]) else None),
+                quote=quote)
+            if grouped:
+                key.append((key_glyph("×3", MUTED),
+                            "trades too close together share a label; "
+                            "each keeps its own dot"))
+            with key_slot:
+                chart_key(key)
 
             if not opening.empty and focus in set(opening["symbol"]):
                 carried = float(opening.loc[opening["symbol"] == focus,

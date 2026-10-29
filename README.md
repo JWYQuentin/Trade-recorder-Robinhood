@@ -146,18 +146,28 @@ Five tabs:
 - **Trades** — every fill, filterable by symbol, side, date range, and *placed
   by*. That last one separates manual trades from automated recurring buys, which
   matters a lot if most of your order count is dollar-cost averaging. Shows
-  Invested / Proceeds / Fees plus a cumulative-net-invested chart.
-- **Holdings** — positions, cost basis, market value, unrealized P&L.
+  Invested / Proceeds / Fees plus a cumulative-net-invested chart. The filters
+  live in the page URL (`?side=Sells&by=You&range=3M`), so a filtered view can
+  be bookmarked.
+- **Holdings** — positions, cost basis, market value, unrealized P&L, and a
+  3-month sparkline of each stock's price.
 - **Realized P&L** — total, per-symbol breakdown, and every closing trade.
 - **Performance** — portfolio value against the capital that built it, a
   comparison against SPY, time- and money-weighted returns, drawdown, realized
   quality (win rate, profit factor), and a split of discretionary trades against
-  automatic ones.
+  automatic ones. A chart range (1M to All) zooms the charts; the figures always
+  cover the whole record.
 - **Stock** — one symbol's daily close (1M to all history) with your own trades
-  marked on it: buys you placed, sells coloured by the gain or loss Robinhood
-  booked, recurring buys as ticks, your average cost, and shares held beneath.
-  Opened by clicking a symbol on Holdings or Realized P&L, or by URL
-  (`http://localhost:8501/?symbol=NVDA`). Works for positions you have closed.
+  marked on it: a dot at each fill price with a dashed leader to a **B** or **S**
+  label, sells coloured by the gain or loss Robinhood booked, trades too close
+  to label one by one grouped under one label with a count, recurring buys as
+  ticks, your average cost, and shares held beneath. Opened by clicking a symbol
+  on Holdings or Realized P&L, or by URL (`http://localhost:8501/?symbol=NVDA`).
+  Works for positions you have closed.
+
+The masthead shows how long ago the last successful sync was, in local time, and
+turns into a warning past 12 hours — the scheduled sync can stop silently when
+Robinhood asks for a fresh sign-in, and nothing else on the page would change.
 
 Realized and unrealized are kept apart on purpose. One is money already received;
 the other is a market estimate that changes daily. The dashboard never adds them.

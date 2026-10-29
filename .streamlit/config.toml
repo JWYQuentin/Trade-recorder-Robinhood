@@ -9,3 +9,10 @@ backgroundColor = "#FBFBFA"
 secondaryBackgroundColor = "#F2F2EF"
 textColor = "#1A1A18"
 font = "sans serif"
+
+# "Clear filters" on the Trades tab resets each filter by writing its value
+# into st.session_state — the only way to change a widget bound to the URL —
+# while the same widgets also declare a default ("All"). Streamlit logs a
+# warning for that pairing on the first reset; here it is intended.
+[global]
+disableWidgetStateDuplicationWarning = true
